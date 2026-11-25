@@ -1,0 +1,5 @@
+include README.md
+include LICENSE
+include semver.txt
+graft tablish
+global-exclude *.py[cod] __pycache__
