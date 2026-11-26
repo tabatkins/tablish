@@ -26,7 +26,9 @@ from .config import (
     parseConfigData as parseConfigData,
 )
 from .release import (
+    PENDING_RELEASE_FILENAME as PENDING_RELEASE_FILENAME,
     MetadataItem as MetadataItem,
+    PendingRelease as PendingRelease,
     ReleaseMetadata as ReleaseMetadata,
     ReleaseOptions as ReleaseOptions,
     ReleaseResult as ReleaseResult,
@@ -40,9 +42,11 @@ from .release import (
     gitTagExists as gitTagExists,
     inProjectRoot as inProjectRoot,
     isGitIgnored as isGitIgnored,
+    loadPendingRelease as loadPendingRelease,
     loadPyPiToken as loadPyPiToken,
     parseSemver as parseSemver,
     resolveSecretsPath as resolveSecretsPath,
+    resumeRelease as resumeRelease,
     runCommand as runCommand,
 )
 
@@ -57,8 +61,10 @@ __all__ = [
     "DEFAULT_TAG_MESSAGE",
     "DEFAULT_TEST_PYPI_SECRET_KEY",
     "DEFAULT_TEST_PYPI_URL",
+    "PENDING_RELEASE_FILENAME",
     "GeneratedFileConfig",
     "MetadataItem",
+    "PendingRelease",
     "ReleaseError",
     "ReleaseMetadata",
     "ReleaseOptions",
@@ -76,12 +82,14 @@ __all__ = [
     "inProjectRoot",
     "isGitIgnored",
     "loadConfig",
+    "loadPendingRelease",
     "loadPyPiToken",
     "main",
     "parseArgs",
     "parseConfigData",
     "parseSemver",
     "resolveSecretsPath",
+    "resumeRelease",
     "runCommand",
     "supportsColor",
 ]

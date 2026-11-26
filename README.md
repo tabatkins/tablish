@@ -39,7 +39,16 @@ tablish bugfix --skip-lint      # skip lint command (still runs check-manifest i
 tablish bugfix --no-tag         # skip creating/pushing a git tag
 tablish bugfix --verbose-pypi   # show verbose output and error details from PyPI upload
 tablish info                    # display resolved publish metadata (explicit vs defaulted)
+tablish resume                  # finish remaining upload and/or git steps after a failure
 ```
+
+### `tablish info`
+
+Prints the resolved metadata and preflight status that `tablish` would use to publish—including project paths, current version, target repository, credential and gitignore status (without printing any token), lint/build settings, required tools, and git release settings. Each entry shows whether it was set explicitly in `[tool.tablish]`, inferred from `pyproject.toml`, defaulted, or overridden by CLI flags (such as `--test`, `--skip-lint`, `--no-tag`, `--verbose-pypi`, or `-C`), using terminal color when supported.
+
+### `tablish resume`
+
+Continues an interrupted release after an irreversible PyPI upload has already started or completed, without rebuilding or re-uploading already-published files. If `twine upload` fails partway through uploading distribution files, `tablish resume` uploads only the remaining file(s) with `--skip-existing` (supporting `--verbose-pypi`) and cleans up build artifacts; if a post-upload git step (`add`, `commit`, `tag`, or `push`) fails, it skips steps already completed and finishes the rest. Supports `--dry-run` to preview remaining actions and `--no-tag` to skip tagging.
 
 ## PyPI Credentials
 

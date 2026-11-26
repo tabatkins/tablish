@@ -35,6 +35,27 @@ class ReleaseOptions:
     noTag: bool = False
     verbosePypi: bool = False
     info: bool = False
+    resume: bool = False
+
+
+PENDING_RELEASE_FILENAME: t.Final[str] = "tablish-resume.json"
+
+
+@dataclass(frozen=True, slots=True)
+class PendingRelease:
+    """State saved once a PyPI upload partially or fully succeeds until git steps finish."""
+
+    previousVersion: str
+    newVersion: str
+    targetRepo: str
+    commitFiles: tuple[str, ...]
+    commitMessage: str
+    tagName: str | None
+    tagMessage: str | None
+    stage: t.ResumeStage = "git"
+    repositoryUrl: str | None = None
+    uploadedFiles: tuple[str, ...] = ()
+    remainingFiles: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True, slots=True)
@@ -127,6 +148,9 @@ def createRelease(
     if options.info:
         msg = "Use collectReleaseMetadata() to inspect publish metadata rather than createRelease()."
         raise ReleaseError(msg)
+    if options.resume:
+        msg = "Use resumeRelease() to finish a pending release rather than createRelease()."
+        raise ReleaseError(msg)
     if options.bump is None and options.version is None:
         msg = "Either a bump type (break/major, feature/minor, bugfix/patch) or an explicit version is required."
         raise ReleaseError(msg)
@@ -143,6 +167,26 @@ def createRelease(
         else:
             msg = f"Run this command from inside the git project root folder ({root})."
         raise ReleaseError(msg)
+
+    if not options.dryRun and not options.test:
+        pending = loadPendingRelease(root)
+        if pending is not None:
+            if pending.stage == "upload":
+                remCount = len(pending.remainingFiles)
+                remNoun = "file" if remCount == 1 else "files"
+                msg = (
+                    f"A previous release ({pending.newVersion}) was partially uploaded to {pending.targetRepo} "
+                    + f"({remCount} {remNoun} remaining).\n"
+                    + "Run `tablish resume` to finish uploading and committing/tagging/pushing "
+                    + "before starting a new release."
+                )
+            else:
+                msg = (
+                    f"A previous release ({pending.newVersion}) was already uploaded to {pending.targetRepo}, "
+                    + "but its git steps have not been completed.\n"
+                    + "Run `tablish resume` to finish committing/tagging/pushing before starting a new release."
+                )
+            raise ReleaseError(msg)
 
     semverPath = root / resolvedConfig.semverFile
     secretsPath = resolveSecretsPath(root, resolvedConfig.secretsFile)
@@ -265,17 +309,20 @@ def createRelease(
         for _, targetPath, _ in renderedGenerated
     ]
 
-    _emit(onMessage, f"Bumping {resolvedConfig.semverFile} to {newVersion}...")
-    for _, targetPath, content in renderedGenerated:
-        targetPath.parent.mkdir(parents=True, exist_ok=True)
-        targetPath.write_text(content, encoding="utf-8")
-    semverPath.write_text(newVersion, encoding="utf-8")
-
     commitFiles = [str(resolvedConfig.semverFile), *(str(entry.path) for entry, _, _ in renderedGenerated)]
     commitMsg = resolvedConfig.commitMessage.format(version=newVersion)
+    tagMsg = resolvedConfig.tagMessage.format(version=newVersion) if tagName is not None else None
     distFiles: list[Path] = []
     keepVersionBump = False
+    keepBuildArtifacts = False
+    pendingRelease: PendingRelease | None = None
     try:
+        _emit(onMessage, f"Bumping {resolvedConfig.semverFile} to {newVersion}...")
+        for _, targetPath, content in renderedGenerated:
+            targetPath.parent.mkdir(parents=True, exist_ok=True)
+            targetPath.write_text(content, encoding="utf-8")
+        semverPath.write_text(newVersion, encoding="utf-8")
+
         cleanBuildArtifacts(root, resolvedConfig.buildDirs)
         assert buildCmd is not None
         runCommand(buildCmd, "Building sdist and wheel", cwd=root, onMessage=onMessage)
@@ -322,36 +369,28 @@ def createRelease(
 
         assert twineCmd is not None
         assert token is not None
-        uploadCmd = [*twineCmd, "upload"]
-        if options.verbosePypi:
-            uploadCmd.append("--verbose")
+        uploadEnv = _buildTwineUploadEnv(token, tokenFromEnv=tokenFromEnv)
+
         if options.test:
-            uploadCmd.extend(["--repository-url", resolvedConfig.testPypiUrl])
-        elif resolvedConfig.pypiUrl is not None:
-            uploadCmd.extend(["--repository-url", resolvedConfig.pypiUrl])
-        uploadCmd.extend(str(path) for path in distFiles)
-
-        uploadEnv = os.environ.copy()
-        if tokenFromEnv:
-            uploadEnv.setdefault("TWINE_USERNAME", "__token__")
-        else:
-            uploadEnv["TWINE_USERNAME"] = "__token__"
-        uploadEnv["TWINE_PASSWORD"] = token
-
-        try:
-            runCommand(
-                uploadCmd,
-                f"Uploading {newVersion} to {targetRepo}",
-                cwd=root,
-                env=uploadEnv,
-                onMessage=onMessage,
+            uploadCmd = _buildTwineUploadCmd(
+                twineCmd,
+                distFiles,
+                verbose=options.verbosePypi,
+                repositoryUrl=resolvedConfig.testPypiUrl,
+                skipExisting=False,
             )
-        except subprocess.CalledProcessError:
-            if not options.verbosePypi:
-                _emit(onMessage, "Hint: Re-run with --verbose-pypi for full PyPI upload error details.")
-            raise
-
-        if options.test:
+            try:
+                runCommand(
+                    uploadCmd,
+                    f"Uploading {newVersion} to {targetRepo}",
+                    cwd=root,
+                    env=uploadEnv,
+                    onMessage=onMessage,
+                )
+            except subprocess.CalledProcessError:
+                if not options.verbosePypi:
+                    _emit(onMessage, "Hint: Re-run with --verbose-pypi for full PyPI upload error details.")
+                raise
             _emit(
                 onMessage,
                 f"Uploaded {newVersion} to {targetRepo}. Rolling back version files and skipping git commit/push.",
@@ -366,9 +405,98 @@ def createRelease(
                 builtFiles=tuple(path.relative_to(root) for path in distFiles),
             )
 
+        relDistFiles = [path.relative_to(root).as_posix() for path in distFiles]
+        uploadedRelPaths: list[str] = []
+        for idx, distPath in enumerate(distFiles):
+            relPath = relDistFiles[idx]
+            uploadCmd = _buildTwineUploadCmd(
+                twineCmd,
+                [distPath],
+                verbose=options.verbosePypi,
+                repositoryUrl=resolvedConfig.pypiUrl,
+                skipExisting=False,
+            )
+            desc = (
+                f"Uploading {newVersion} ({idx + 1}/{len(distFiles)}: {distPath.name}) to {targetRepo}"
+                if len(distFiles) > 1
+                else f"Uploading {newVersion} to {targetRepo}"
+            )
+            try:
+                runCommand(uploadCmd, desc, cwd=root, env=uploadEnv, onMessage=onMessage)
+            except subprocess.CalledProcessError as exc:
+                if not options.verbosePypi:
+                    _emit(onMessage, "Hint: Re-run with --verbose-pypi for full PyPI upload error details.")
+                if uploadedRelPaths:
+                    remainingRelPaths = tuple(relDistFiles[idx:])
+                    partialPending = PendingRelease(
+                        previousVersion=currentVersion,
+                        newVersion=newVersion,
+                        targetRepo=targetRepo,
+                        commitFiles=tuple(commitFiles),
+                        commitMessage=commitMsg,
+                        tagName=tagName,
+                        tagMessage=tagMsg,
+                        stage="upload",
+                        repositoryUrl=resolvedConfig.pypiUrl,
+                        uploadedFiles=tuple(uploadedRelPaths),
+                        remainingFiles=remainingRelPaths,
+                    )
+                    _savePendingRelease(root, partialPending)
+                    keepVersionBump = True
+                    keepBuildArtifacts = True
+                    uploadedSummary = ", ".join(uploadedRelPaths)
+                    remainingSummary = ", ".join(remainingRelPaths)
+                    msg = (
+                        f"Version {newVersion} was PARTIALLY uploaded to {targetRepo} "
+                        + f"(uploaded: {uploadedSummary}; remaining: {remainingSummary}), "
+                        + f"but uploading {relPath} failed (exit code {exc.returncode}).\n"
+                        + "Do NOT start a new release; resolve the upload issue and run `tablish resume` "
+                        + "to upload the remaining file(s) and finish committing/tagging/pushing."
+                    )
+                    raise ReleaseError(msg) from exc
+                raise
+
+            uploadedRelPaths.append(relPath)
+            remainingAfter = tuple(relDistFiles[idx + 1 :])
+            if remainingAfter:
+                keepVersionBump = True
+                keepBuildArtifacts = True
+                _savePendingRelease(
+                    root,
+                    PendingRelease(
+                        previousVersion=currentVersion,
+                        newVersion=newVersion,
+                        targetRepo=targetRepo,
+                        commitFiles=tuple(commitFiles),
+                        commitMessage=commitMsg,
+                        tagName=tagName,
+                        tagMessage=tagMsg,
+                        stage="upload",
+                        repositoryUrl=resolvedConfig.pypiUrl,
+                        uploadedFiles=tuple(uploadedRelPaths),
+                        remainingFiles=remainingAfter,
+                    ),
+                )
+
+        pendingRelease = PendingRelease(
+            previousVersion=currentVersion,
+            newVersion=newVersion,
+            targetRepo=targetRepo,
+            commitFiles=tuple(commitFiles),
+            commitMessage=commitMsg,
+            tagName=tagName,
+            tagMessage=tagMsg,
+            stage="git",
+            repositoryUrl=resolvedConfig.pypiUrl,
+            uploadedFiles=tuple(uploadedRelPaths),
+            remainingFiles=(),
+        )
+        _savePendingRelease(root, pendingRelease)
         keepVersionBump = True
+        keepBuildArtifacts = False
     finally:
-        cleanBuildArtifacts(root, resolvedConfig.buildDirs)
+        if not keepBuildArtifacts:
+            cleanBuildArtifacts(root, resolvedConfig.buildDirs)
         if not keepVersionBump:
             semverPath.write_text(originalSemverContent, encoding="utf-8")
             for targetPath, originalContent in originalGeneratedContents:
@@ -377,32 +505,8 @@ def createRelease(
                 elif targetPath.exists():
                     targetPath.unlink()
 
-    try:
-        stageLabel = f"Staging {commitFiles[0]}" if len(commitFiles) == 1 else "Staging version files"
-        runCommand(["git", "add", "--", *commitFiles], stageLabel, cwd=root, onMessage=onMessage)
-        runCommand(
-            ["git", "commit", "-m", commitMsg, "--", *commitFiles],
-            "Committing version bump",
-            cwd=root,
-            onMessage=onMessage,
-        )
-        if tagName is not None:
-            tagMsg = resolvedConfig.tagMessage.format(version=newVersion)
-            runCommand(
-                ["git", "tag", "-a", tagName, "-m", tagMsg],
-                f"Tagging {tagName}",
-                cwd=root,
-                onMessage=onMessage,
-            )
-        pushCmd = ["git", "push", "--follow-tags"] if tagName is not None else ["git", "push"]
-        runCommand(pushCmd, "Pushing release commit", cwd=root, onMessage=onMessage)
-    except subprocess.CalledProcessError as exc:
-        msg = (
-            f"Version {newVersion} was ALREADY uploaded to {targetRepo}, "
-            + f"but the git step failed (exit code {exc.returncode}).\n"
-            + "Do NOT re-upload; finish committing/tagging/pushing manually."
-        )
-        raise ReleaseError(msg) from exc
+    assert pendingRelease is not None
+    _finalizeReleaseGit(root, pendingRelease, buildDirs=resolvedConfig.buildDirs, onMessage=onMessage)
 
     _emit(onMessage, f"Successfully released {newVersion}!")
     return ReleaseResult(
@@ -413,6 +517,229 @@ def createRelease(
         dryRun=False,
         test=False,
         builtFiles=tuple(path.relative_to(root) for path in distFiles),
+    )
+
+
+def resumeRelease(
+    options: ReleaseOptions | None = None,
+    *,
+    projectRoot: Path | None = None,
+    config: TablishConfig | None = None,
+    onMessage: t.MessageCallback | None = None,
+) -> ReleaseResult:
+    """Finish pending upload and/or git commit/tag/push steps after an interrupted release."""
+    opts = options if options is not None else ReleaseOptions(resume=True)
+    if opts.test:
+        msg = "Cannot combine 'resume' with --test."
+        raise ReleaseError(msg)
+
+    root = (projectRoot or Path.cwd()).resolve()
+    resolvedConfig = config if config is not None else loadConfig(root)
+
+    if not inProjectRoot(root, resolvedConfig.projectName):
+        if resolvedConfig.projectName:
+            msg = f"Run this command from inside the {resolvedConfig.projectName} project root folder."
+        else:
+            msg = f"Run this command from inside the git project root folder ({root})."
+        raise ReleaseError(msg)
+
+    pending = loadPendingRelease(root)
+    if pending is None:
+        msg = "No pending release to resume (no incomplete upload or git steps found)."
+        raise ReleaseError(msg)
+
+    effectivePending = (
+        PendingRelease(
+            previousVersion=pending.previousVersion,
+            newVersion=pending.newVersion,
+            targetRepo=pending.targetRepo,
+            commitFiles=pending.commitFiles,
+            commitMessage=pending.commitMessage,
+            tagName=None,
+            tagMessage=None,
+            stage=pending.stage,
+            repositoryUrl=pending.repositoryUrl,
+            uploadedFiles=pending.uploadedFiles,
+            remainingFiles=pending.remainingFiles,
+        )
+        if opts.noTag
+        else pending
+    )
+
+    modeSuffix = " (dry run)" if opts.dryRun else ""
+    if effectivePending.stage == "upload":
+        _emit(
+            onMessage,
+            f"Resuming partial upload for {effectivePending.newVersion} to "
+            + f"{effectivePending.targetRepo}{modeSuffix}...",
+        )
+        secretsPath = resolveSecretsPath(root, resolvedConfig.secretsFile)
+        ensureSecretsGitIgnored(root, secretsPath)
+        twineCmd = findToolCommand("twine", "twine")
+        if twineCmd is None and not opts.dryRun:
+            msg = (
+                "Missing required release tool(s): twine\n"
+                + f"Active Python: {sys.executable}\n"
+                + "Install them with:\n"
+                + "  python -m pip install twine"
+            )
+            raise ReleaseError(msg)
+        token, tokenFromEnv = loadPyPiToken(
+            secretsPath,
+            isTest=False,
+            required=not opts.dryRun,
+            pypiSecretKey=resolvedConfig.pypiSecretKey,
+            testPypiSecretKey=resolvedConfig.testPypiSecretKey,
+            onMessage=onMessage,
+        )
+        for relFile in effectivePending.remainingFiles:
+            if not (root / relFile).is_file():
+                msg = (
+                    f"Pending distribution file {relFile} is missing; cannot resume upload.\n"
+                    + f"Rebuild version {effectivePending.newVersion} or upload it manually with "
+                    + "`twine upload --skip-existing`."
+                )
+                raise ReleaseError(msg)
+    else:
+        _emit(
+            onMessage,
+            f"Resuming release {effectivePending.newVersion} "
+            + f"(already uploaded to {effectivePending.targetRepo}){modeSuffix}...",
+        )
+        twineCmd = None
+        token = None
+        tokenFromEnv = False
+
+    if opts.dryRun:
+        if effectivePending.stage == "upload":
+            remList = ", ".join(effectivePending.remainingFiles)
+            _emit(onMessage, f"Would upload remaining file(s) with --skip-existing: {remList}")
+            if resolvedConfig.buildDirs:
+                _emit(onMessage, f"Would clean build directories: {', '.join(resolvedConfig.buildDirs)}")
+        needCommit = _needsVersionCommit(root, effectivePending)
+        needTag = _needsReleaseTag(root, effectivePending)
+        if needCommit:
+            fileList = ", ".join(effectivePending.commitFiles)
+            _emit(onMessage, f"Would stage and commit {fileList} ({effectivePending.commitMessage!r}).")
+        else:
+            _emit(onMessage, f"Version files already committed ({effectivePending.newVersion}); would skip commit.")
+        if effectivePending.tagName is not None:
+            if needTag:
+                _emit(onMessage, f"Would create annotated tag {effectivePending.tagName}.")
+            else:
+                _emit(onMessage, f"Tag {effectivePending.tagName} already exists on HEAD; would skip tag.")
+        pushDesc = "git push --follow-tags" if effectivePending.tagName is not None else "git push"
+        _emit(onMessage, f"Would run `{pushDesc}`.")
+        return ReleaseResult(
+            previousVersion=effectivePending.previousVersion,
+            newVersion=effectivePending.newVersion,
+            tagName=effectivePending.tagName,
+            targetRepo=effectivePending.targetRepo,
+            dryRun=True,
+            test=False,
+            builtFiles=tuple(Path(p) for p in effectivePending.remainingFiles),
+        )
+
+    gitPending = effectivePending
+    uploadedOnResume: list[Path] = []
+    if effectivePending.stage == "upload":
+        assert twineCmd is not None
+        assert token is not None
+        uploadEnv = _buildTwineUploadEnv(token, tokenFromEnv=tokenFromEnv)
+        uploadedSoFar = list(effectivePending.uploadedFiles)
+        remainingList = list(effectivePending.remainingFiles)
+        for idx, relPath in enumerate(remainingList):
+            distPath = root / relPath
+            uploadCmd = _buildTwineUploadCmd(
+                twineCmd,
+                [distPath],
+                verbose=opts.verbosePypi,
+                repositoryUrl=effectivePending.repositoryUrl,
+                skipExisting=True,
+            )
+            desc = (
+                f"Uploading remaining {effectivePending.newVersion} "
+                + f"({idx + 1}/{len(remainingList)}: {distPath.name}) to {effectivePending.targetRepo}"
+                if len(remainingList) > 1
+                else f"Uploading remaining {effectivePending.newVersion} ({distPath.name}) "
+                + f"to {effectivePending.targetRepo}"
+            )
+            try:
+                runCommand(uploadCmd, desc, cwd=root, env=uploadEnv, onMessage=onMessage)
+            except subprocess.CalledProcessError as exc:
+                if not opts.verbosePypi:
+                    _emit(onMessage, "Hint: Re-run `tablish resume --verbose-pypi` for full PyPI upload error details.")
+                stillRemaining = tuple(remainingList[idx:])
+                _savePendingRelease(
+                    root,
+                    PendingRelease(
+                        previousVersion=effectivePending.previousVersion,
+                        newVersion=effectivePending.newVersion,
+                        targetRepo=effectivePending.targetRepo,
+                        commitFiles=effectivePending.commitFiles,
+                        commitMessage=effectivePending.commitMessage,
+                        tagName=effectivePending.tagName,
+                        tagMessage=effectivePending.tagMessage,
+                        stage="upload",
+                        repositoryUrl=effectivePending.repositoryUrl,
+                        uploadedFiles=tuple(uploadedSoFar),
+                        remainingFiles=stillRemaining,
+                    ),
+                )
+                msg = (
+                    f"Uploading {relPath} for {effectivePending.newVersion} failed (exit code {exc.returncode}); "
+                    + f"remaining: {', '.join(stillRemaining)}.\n"
+                    + "Resolve the upload issue and run `tablish resume` again."
+                )
+                raise ReleaseError(msg) from exc
+
+            uploadedSoFar.append(relPath)
+            uploadedOnResume.append(Path(relPath))
+            remainingAfter = tuple(remainingList[idx + 1 :])
+            if remainingAfter:
+                _savePendingRelease(
+                    root,
+                    PendingRelease(
+                        previousVersion=effectivePending.previousVersion,
+                        newVersion=effectivePending.newVersion,
+                        targetRepo=effectivePending.targetRepo,
+                        commitFiles=effectivePending.commitFiles,
+                        commitMessage=effectivePending.commitMessage,
+                        tagName=effectivePending.tagName,
+                        tagMessage=effectivePending.tagMessage,
+                        stage="upload",
+                        repositoryUrl=effectivePending.repositoryUrl,
+                        uploadedFiles=tuple(uploadedSoFar),
+                        remainingFiles=remainingAfter,
+                    ),
+                )
+
+        gitPending = PendingRelease(
+            previousVersion=effectivePending.previousVersion,
+            newVersion=effectivePending.newVersion,
+            targetRepo=effectivePending.targetRepo,
+            commitFiles=effectivePending.commitFiles,
+            commitMessage=effectivePending.commitMessage,
+            tagName=effectivePending.tagName,
+            tagMessage=effectivePending.tagMessage,
+            stage="git",
+            repositoryUrl=effectivePending.repositoryUrl,
+            uploadedFiles=tuple(uploadedSoFar),
+            remainingFiles=(),
+        )
+        _savePendingRelease(root, gitPending)
+        cleanBuildArtifacts(root, resolvedConfig.buildDirs)
+
+    _finalizeReleaseGit(root, gitPending, buildDirs=resolvedConfig.buildDirs, onMessage=onMessage)
+    _emit(onMessage, f"Successfully finished releasing {gitPending.newVersion}!")
+    return ReleaseResult(
+        previousVersion=gitPending.previousVersion,
+        newVersion=gitPending.newVersion,
+        tagName=gitPending.tagName,
+        targetRepo=gitPending.targetRepo,
+        dryRun=False,
+        test=False,
+        builtFiles=tuple(uploadedOnResume),
     )
 
 
@@ -466,6 +793,262 @@ def gitTagExists(projectRoot: Path, tagName: str) -> bool:
         check=False,
     )
     return result.returncode == 0
+
+
+def _gitCommitHash(projectRoot: Path, rev: str) -> str | None:
+    """Resolve a git revision to its full commit SHA, or None if unavailable."""
+    result = subprocess.run(
+        ["git", "rev-parse", "--verify", "--quiet", rev],
+        cwd=projectRoot,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    if result.returncode != 0:
+        return None
+    sha = result.stdout.strip()
+    return sha if sha else None
+
+
+def _getPendingReleasePath(projectRoot: Path) -> Path | None:
+    """Return the path to the pending release state file inside the repository's git dir."""
+    try:
+        result = subprocess.run(
+            ["git", "rev-parse", "--git-path", PENDING_RELEASE_FILENAME],
+            cwd=projectRoot,
+            capture_output=True,
+            text=True,
+            check=True,
+        )
+    except (OSError, subprocess.CalledProcessError):
+        return None
+    rawPath = result.stdout.strip()
+    if not rawPath:
+        return None
+    path = Path(rawPath)
+    return path if path.is_absolute() else (projectRoot / path)
+
+
+def _buildTwineUploadCmd(
+    twineCmd: t.Sequence[str],
+    distFiles: t.Sequence[Path],
+    *,
+    verbose: bool,
+    repositoryUrl: str | None,
+    skipExisting: bool,
+) -> list[str]:
+    """Construct a `twine upload` argv list for one or more distribution files."""
+    cmd = [*twineCmd, "upload"]
+    if verbose:
+        cmd.append("--verbose")
+    if skipExisting:
+        cmd.append("--skip-existing")
+    if repositoryUrl is not None:
+        cmd.extend(["--repository-url", repositoryUrl])
+    cmd.extend(str(path) for path in distFiles)
+    return cmd
+
+
+def _buildTwineUploadEnv(token: str, *, tokenFromEnv: bool) -> dict[str, str]:
+    """Build subprocess environment variables carrying PyPI upload credentials."""
+    uploadEnv = os.environ.copy()
+    if tokenFromEnv:
+        uploadEnv.setdefault("TWINE_USERNAME", "__token__")
+    else:
+        uploadEnv["TWINE_USERNAME"] = "__token__"
+    uploadEnv["TWINE_PASSWORD"] = token
+    return uploadEnv
+
+
+def _savePendingRelease(projectRoot: Path, pending: PendingRelease) -> None:
+    """Persist pending upload/git release state into the repository's git directory."""
+    path = _getPendingReleasePath(projectRoot)
+    if path is None:
+        return
+    payload = {
+        "stage": pending.stage,
+        "previousVersion": pending.previousVersion,
+        "newVersion": pending.newVersion,
+        "targetRepo": pending.targetRepo,
+        "repositoryUrl": pending.repositoryUrl,
+        "commitFiles": list(pending.commitFiles),
+        "commitMessage": pending.commitMessage,
+        "tagName": pending.tagName,
+        "tagMessage": pending.tagMessage,
+        "uploadedFiles": list(pending.uploadedFiles),
+        "remainingFiles": list(pending.remainingFiles),
+    }
+    path.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
+
+
+def _clearPendingRelease(projectRoot: Path) -> None:
+    """Remove any saved pending release state file."""
+    path = _getPendingReleasePath(projectRoot)
+    if path is not None:
+        path.unlink(missing_ok=True)
+
+
+def loadPendingRelease(projectRoot: Path) -> PendingRelease | None:
+    """Load pending upload/git release state from the repository's git directory, if present."""
+    path = _getPendingReleasePath(projectRoot)
+    if path is None or not path.is_file():
+        return None
+    try:
+        rawData = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        msg = f"Invalid pending release state in {path}: {exc}"
+        raise ReleaseError(msg) from exc
+    if not isinstance(rawData, dict):
+        msg = f"Invalid pending release state in {path}: expected a JSON object."
+        raise ReleaseError(msg)
+
+    rawStage = rawData.get("stage", "git")
+    previousVersion = rawData.get("previousVersion")
+    newVersion = rawData.get("newVersion")
+    targetRepo = rawData.get("targetRepo")
+    repositoryUrl = rawData.get("repositoryUrl")
+    rawCommitFiles = rawData.get("commitFiles")
+    commitMessage = rawData.get("commitMessage")
+    tagName = rawData.get("tagName")
+    tagMessage = rawData.get("tagMessage")
+    rawUploadedFiles = rawData.get("uploadedFiles", [])
+    rawRemainingFiles = rawData.get("remainingFiles", [])
+
+    if (
+        rawStage not in ("upload", "git")
+        or not isinstance(previousVersion, str)
+        or not isinstance(newVersion, str)
+        or not newVersion.strip()
+        or not isinstance(targetRepo, str)
+        or not targetRepo.strip()
+        or (repositoryUrl is not None and (not isinstance(repositoryUrl, str) or not repositoryUrl.strip()))
+        or not isinstance(rawCommitFiles, list)
+        or not rawCommitFiles
+        or not all(isinstance(item, str) and item.strip() for item in rawCommitFiles)
+        or not isinstance(commitMessage, str)
+        or not commitMessage.strip()
+        or (tagName is not None and (not isinstance(tagName, str) or not tagName.strip()))
+        or (tagMessage is not None and not isinstance(tagMessage, str))
+        or (tagName is not None and tagMessage is None)
+        or not isinstance(rawUploadedFiles, list)
+        or not all(isinstance(item, str) and item.strip() for item in rawUploadedFiles)
+        or not isinstance(rawRemainingFiles, list)
+        or not all(isinstance(item, str) and item.strip() for item in rawRemainingFiles)
+        or (rawStage == "upload" and not rawRemainingFiles)
+    ):
+        msg = f"Invalid pending release state in {path}: missing or malformed fields."
+        raise ReleaseError(msg)
+
+    stage: t.ResumeStage = "upload" if rawStage == "upload" else "git"
+    return PendingRelease(
+        previousVersion=previousVersion,
+        newVersion=newVersion,
+        targetRepo=targetRepo,
+        commitFiles=tuple(rawCommitFiles),
+        commitMessage=commitMessage,
+        tagName=tagName,
+        tagMessage=tagMessage,
+        stage=stage,
+        repositoryUrl=repositoryUrl,
+        uploadedFiles=tuple(rawUploadedFiles),
+        remainingFiles=tuple(rawRemainingFiles),
+    )
+
+
+def _needsVersionCommit(projectRoot: Path, pending: PendingRelease) -> bool:
+    """Return True if any pending commit files still have uncommitted changes."""
+    for relFile in pending.commitFiles:
+        if not (projectRoot / relFile).is_file():
+            msg = f"Expected release file {relFile} is missing. Restore it before running `tablish resume`."
+            raise ReleaseError(msg)
+    statusResult = subprocess.run(
+        ["git", "status", "--porcelain", "--", *pending.commitFiles],
+        cwd=projectRoot,
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+    if any(line.strip() for line in statusResult.stdout.splitlines()):
+        return True
+
+    semverPath = projectRoot / pending.commitFiles[0]
+    actualVersion = semverPath.read_text(encoding="utf-8").strip()
+    if actualVersion != pending.newVersion:
+        msg = (
+            f"Expected {pending.commitFiles[0]} to contain {pending.newVersion!r}, "
+            + f"but found {actualVersion!r}. Restore the bumped version files before running `tablish resume`."
+        )
+        raise ReleaseError(msg)
+    return False
+
+
+def _needsReleaseTag(projectRoot: Path, pending: PendingRelease) -> bool:
+    """Return True if the release tag still needs to be created, validating any existing tag."""
+    if pending.tagName is None:
+        return False
+    if not gitTagExists(projectRoot, pending.tagName):
+        return True
+    tagCommit = _gitCommitHash(projectRoot, f"refs/tags/{pending.tagName}^{{commit}}")
+    headCommit = _gitCommitHash(projectRoot, "HEAD")
+    if tagCommit is not None and tagCommit == headCommit:
+        return False
+    tagLabel = tagCommit[:12] if tagCommit is not None else "unknown"
+    headLabel = headCommit[:12] if headCommit is not None else "unknown"
+    msg = (
+        f"Git tag {pending.tagName} already exists, but points to {tagLabel} instead of HEAD ({headLabel}).\n"
+        + f"Fix or delete the tag (e.g. `git tag -d {pending.tagName}`), then run `tablish resume` again."
+    )
+    raise ReleaseError(msg)
+
+
+def _finalizeReleaseGit(
+    projectRoot: Path,
+    pending: PendingRelease,
+    *,
+    buildDirs: t.Sequence[str] = (),
+    onMessage: t.MessageCallback | None = None,
+) -> None:
+    """Idempotently clean leftover build dirs, commit version files, tag, push, and clear resume state."""
+    if buildDirs:
+        cleanBuildArtifacts(projectRoot, buildDirs)
+    try:
+        if _needsVersionCommit(projectRoot, pending):
+            stageLabel = (
+                f"Staging {pending.commitFiles[0]}" if len(pending.commitFiles) == 1 else "Staging version files"
+            )
+            runCommand(["git", "add", "--", *pending.commitFiles], stageLabel, cwd=projectRoot, onMessage=onMessage)
+            runCommand(
+                ["git", "commit", "-m", pending.commitMessage, "--", *pending.commitFiles],
+                "Committing version bump",
+                cwd=projectRoot,
+                onMessage=onMessage,
+            )
+        else:
+            _emit(onMessage, f"==> Version files already committed ({pending.newVersion}); skipping commit.")
+
+        if pending.tagName is not None:
+            if _needsReleaseTag(projectRoot, pending):
+                assert pending.tagMessage is not None
+                runCommand(
+                    ["git", "tag", "-a", pending.tagName, "-m", pending.tagMessage],
+                    f"Tagging {pending.tagName}",
+                    cwd=projectRoot,
+                    onMessage=onMessage,
+                )
+            else:
+                _emit(onMessage, f"==> Tag {pending.tagName} already exists on HEAD; skipping tag.")
+
+        pushCmd = ["git", "push", "--follow-tags"] if pending.tagName is not None else ["git", "push"]
+        runCommand(pushCmd, "Pushing release commit", cwd=projectRoot, onMessage=onMessage)
+    except subprocess.CalledProcessError as exc:
+        msg = (
+            f"Version {pending.newVersion} was ALREADY uploaded to {pending.targetRepo}, "
+            + f"but the git step failed (exit code {exc.returncode}).\n"
+            + "Do NOT re-upload; resolve the git issue and run `tablish resume` to finish committing/tagging/pushing."
+        )
+        raise ReleaseError(msg) from exc
+
+    _clearPendingRelease(projectRoot)
 
 
 def _normalizeInRepoPath(projectRoot: Path, path: Path) -> Path | None:
@@ -887,6 +1470,42 @@ def collectReleaseMetadata(
         items.append(_configItem("Git & Release", "generated-files", f"{fileCount} {fileNoun}", details=genDetails))
     else:
         items.append(_configItem("Git & Release", "generated-files", "(none)"))
+
+    if isValidRepo:
+        try:
+            pendingResume = loadPendingRelease(root)
+        except ReleaseError:
+            items.append(
+                MetadataItem(
+                    "Git & Release",
+                    "pending-resume",
+                    f"invalid {PENDING_RELEASE_FILENAME} in git dir",
+                    "derived",
+                    status="error",
+                ),
+            )
+        else:
+            if pendingResume is not None:
+                if pendingResume.stage == "upload":
+                    remCount = len(pendingResume.remainingFiles)
+                    remNoun = "file" if remCount == 1 else "files"
+                    pendingSummary = (
+                        f"{pendingResume.newVersion} partially uploaded to {pendingResume.targetRepo} "
+                        + f"({remCount} {remNoun} remaining; run `tablish resume`)"
+                    )
+                else:
+                    pendingSummary = (
+                        f"{pendingResume.newVersion} uploaded to {pendingResume.targetRepo} (run `tablish resume`)"
+                    )
+                items.append(
+                    MetadataItem(
+                        "Git & Release",
+                        "pending-resume",
+                        pendingSummary,
+                        "derived",
+                        status="warning",
+                    ),
+                )
 
     return ReleaseMetadata(projectRoot=root, config=resolvedConfig, items=tuple(items))
 

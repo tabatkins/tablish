@@ -9,6 +9,7 @@ type BumpType = Literal["break", "feature", "bugfix", "major", "minor", "patch"]
 type ConfigSource = Literal["explicit", "inferred", "default"]
 type MetadataSource = Literal["explicit", "inferred", "default", "cli", "derived"]
 type MetadataStatus = Literal["ok", "warning", "error"]
+type ResumeStage = Literal["upload", "git"]
 type Semver = tuple[int, int, int]
 type MessageCallback = Callable[[str], None]
 
@@ -32,6 +33,7 @@ __all__ = [
     "MetadataSource",
     "MetadataStatus",
     "Protocol",
+    "ResumeStage",
     "Semver",
     "Sequence",
     "SupportsIsatty",

@@ -20,13 +20,16 @@ from tablish import (
     formatReleaseMetadata,
     inProjectRoot,
     isGitIgnored,
+    loadPendingRelease,
     loadPyPiToken,
     main,
     parseArgs,
     parseSemver,
     release as releaseMod,
     resolveSecretsPath,
+    resumeRelease,
     supportsColor,
+    t,
 )
 
 
@@ -88,6 +91,7 @@ def _installFakeTooling(
     tmpPath: Path,
     *,
     failUpload: bool = False,
+    failUploadSuffix: str | None = None,
     recordLog: Path | None = None,
 ) -> Path:
     """Monkeypatch findToolCommand to invoke lightweight local Python scripts."""
@@ -115,7 +119,11 @@ def _installFakeTooling(
         + '    fh.write(json.dumps({"tool": "twine", "args": sys.argv[1:], '
         + '"user": os.environ.get("TWINE_USERNAME"), "auth": os.environ.get("TWINE_PASSWORD")}) + "\\n")\n'
         + f'if {failUpload!r} and sys.argv[1:2] == ["upload"]:\n'
-        + "    sys.exit(2)\n",
+        + "    sys.exit(2)\n"
+        + f"failSuffix = {failUploadSuffix!r}\n"
+        + 'if failSuffix is not None and sys.argv[1:2] == ["upload"] '
+        + "and any(arg.endswith(failSuffix) for arg in sys.argv[2:]):\n"
+        + "    sys.exit(3)\n",
         encoding="utf-8",
     )
 
@@ -195,8 +203,13 @@ def test_parse_args_modes() -> None:
         ReleaseOptions(test=True, noTag=True, info=True),
         Path("sub"),
     )
+    assert parseArgs(["resume"]) == (ReleaseOptions(resume=True), None)
+    assert parseArgs(["resume", "--dry-run", "--no-tag", "-C", "sub"]) == (
+        ReleaseOptions(dryRun=True, noTag=True, resume=True),
+        Path("sub"),
+    )
 
-    for badArgv in ([], ["bugfix", "1.2.3"], ["invalid"], ["1.2"], ["--set-version", "2.0.5"]):
+    for badArgv in ([], ["bugfix", "1.2.3"], ["invalid"], ["1.2"], ["--set-version", "2.0.5"], ["resume", "--test"]):
         with pytest.raises(SystemExit):
             parseArgs(badArgv)
 
@@ -310,13 +323,15 @@ def test_full_release_commits_tags_pushes_and_writes_generated_files(
     assert "refs/tags/rel-1.2.4" in _git(repo, "ls-remote", "origin")
 
     calls = _readToolLog(logPath)
-    assert [call["tool"] for call in calls] == ["build", "twine", "twine"]
-    uploadArgs = calls[2]["args"]
-    assert isinstance(uploadArgs, list)
-    assert uploadArgs[0] == "upload"
-    assert "--verbose" not in uploadArgs
-    assert calls[2]["user"] == "__token__"
-    assert calls[2]["auth"] == "pypi-live-token"
+    assert [call["tool"] for call in calls] == ["build", "twine", "twine", "twine"]
+    for uploadCall in calls[2:]:
+        uploadArgs = uploadCall["args"]
+        assert isinstance(uploadArgs, list)
+        assert uploadArgs[0] == "upload"
+        assert "--verbose" not in uploadArgs
+        assert "--skip-existing" not in uploadArgs
+        assert uploadCall["user"] == "__token__"
+        assert uploadCall["auth"] == "pypi-live-token"
 
 
 def test_verbose_pypi_passes_verbose_to_twine_upload(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -672,3 +687,260 @@ def test_info_command_metadata_and_formatting(
     assert "[cli: --test]" in captured.out
     assert "[cli: --skip-lint]" in captured.out
     assert "pypi-secret-do-not-print" not in captured.out
+
+
+def test_resume_after_git_push_failure(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """Resume cleanly after a post-upload git push failure without re-uploading or re-committing."""
+    repo, _ = _createSampleRepo(tmp_path, name="pushfail", withRemote=False)
+    (repo / "secrets.json").write_text(json.dumps({"pypi.org release key": "pypi-live"}), encoding="utf-8")
+    logPath = _installFakeTooling(monkeypatch, tmp_path)
+
+    # First release uploads, commits, tags, and fails on `git push` (no remote yet)
+    with pytest.raises(ReleaseError, match=r"(?s)ALREADY uploaded.*tablish resume") as excInfo:
+        createRelease(ReleaseOptions(bump="bugfix"), projectRoot=repo)
+    assert "tablish resume" in str(excInfo.value)
+    assert loadPendingRelease(repo) is not None
+    assert _git(repo, "tag", "-l") == "v1.2.4"
+
+    # Starting a new release while one is pending is blocked
+    with pytest.raises(ReleaseError, match="tablish resume"):
+        createRelease(ReleaseOptions(bump="bugfix"), projectRoot=repo)
+
+    # `tablish info` reports the pending resume
+    infoMeta = collectReleaseMetadata(ReleaseOptions(info=True), projectRoot=repo)
+    infoByKey = {item.key: item for item in infoMeta.items}
+    assert infoByKey["pending-resume"].status == "warning"
+    assert "1.2.4" in infoByKey["pending-resume"].value
+
+    # `tablish resume --dry-run` reports skipping commit/tag and preserves pending state
+    dryMessages: list[str] = []
+    dryResult = resumeRelease(ReleaseOptions(resume=True, dryRun=True), projectRoot=repo, onMessage=dryMessages.append)
+    assert dryResult.dryRun is True
+    assert dryResult.newVersion == "1.2.4"
+    assert any("already committed" in msg for msg in dryMessages)
+    assert any("already exists on HEAD" in msg for msg in dryMessages)
+    assert loadPendingRelease(repo) is not None
+
+    # Attach remote and finish via CLI `tablish resume`
+    remoteRepo = tmp_path / "pushfail-origin.git"
+    subprocess.run(["git", "init", "--bare", str(remoteRepo)], check=True, capture_output=True)
+    _git(repo, "remote", "add", "origin", str(remoteRepo))
+    branch = _git(repo, "branch", "--show-current")
+    _git(repo, "config", f"branch.{branch}.remote", "origin")
+    _git(repo, "config", f"branch.{branch}.merge", f"refs/heads/{branch}")
+
+    callsBeforeResume = len(_readToolLog(logPath))
+    assert main(["resume", "-C", str(repo)]) == 0
+    captured = capsys.readouterr()
+    assert "Successfully finished releasing 1.2.4!" in captured.out
+    assert len(_readToolLog(logPath)) == callsBeforeResume  # No re-build or re-upload
+    assert loadPendingRelease(repo) is None
+    assert "refs/tags/v1.2.4" in _git(repo, "ls-remote", "origin")
+
+    # Resuming again when nothing is pending raises ReleaseError
+    with pytest.raises(ReleaseError, match="No pending release to resume"):
+        resumeRelease(ReleaseOptions(resume=True), projectRoot=repo)
+
+
+def test_resume_after_git_commit_failure_and_multi_step_retry(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Resume across commit failure (pre-commit hook) followed by push failure and final success."""
+    pyproject = (
+        '[project]\nname = "hookdemo"\n\n'
+        + "[tool.tablish]\n"
+        + 'project-name = "hookdemo"\n\n'
+        + "[[tool.tablish.generated-files]]\n"
+        + 'path = "generated/version.txt"\n'
+        + 'template = "{version}"\n'
+    )
+    repo, _ = _createSampleRepo(tmp_path, name="hookdemo", pyprojectBody=pyproject, withRemote=False)
+    (repo / "secrets.json").write_text(json.dumps({"pypi.org release key": "pypi-live"}), encoding="utf-8")
+    logPath = _installFakeTooling(monkeypatch, tmp_path)
+
+    # Install a failing pre-commit hook so git commit fails right after upload
+    hookPath = repo / ".git" / "hooks" / "pre-commit"
+    hookPath.write_text("#!/bin/sh\nexit 1\n", encoding="utf-8")
+    hookPath.chmod(0o755)
+
+    with pytest.raises(ReleaseError, match="tablish resume"):
+        createRelease(ReleaseOptions(bump="feature"), projectRoot=repo)
+    assert (repo / "semver.txt").read_text(encoding="utf-8") == "1.3.0"
+    assert (repo / "generated" / "version.txt").read_text(encoding="utf-8") == "1.3.0"
+    assert _git(repo, "tag", "-l") == ""
+    assert loadPendingRelease(repo) is not None
+
+    # Fix pre-commit hook; first resume commits & tags, then fails at push (still no remote)
+    hookPath.unlink()
+    with pytest.raises(ReleaseError, match="tablish resume"):
+        resumeRelease(ReleaseOptions(resume=True), projectRoot=repo)
+    assert _git(repo, "log", "-1", "--format=%s") == "Bump semver to 1.3.0"
+    assert _git(repo, "tag", "-l") == "v1.3.0"
+    assert loadPendingRelease(repo) is not None
+
+    # If tag is moved to an older commit, resume refuses instead of pushing a stale tag
+    initialSha = _git(repo, "rev-parse", "HEAD~1")
+    _git(repo, "tag", "-f", "-a", "v1.3.0", "-m", "Wrong commit", initialSha)
+    with pytest.raises(ReleaseError, match="points to"):
+        resumeRelease(ReleaseOptions(resume=True), projectRoot=repo)
+    _git(repo, "tag", "-d", "v1.3.0")
+
+    # Attach remote and finish; resume recreates v1.3.0 on HEAD and pushes
+    remoteRepo = tmp_path / "hookdemo-origin.git"
+    subprocess.run(["git", "init", "--bare", str(remoteRepo)], check=True, capture_output=True)
+    _git(repo, "remote", "add", "origin", str(remoteRepo))
+    branch = _git(repo, "branch", "--show-current")
+    _git(repo, "config", f"branch.{branch}.remote", "origin")
+    _git(repo, "config", f"branch.{branch}.merge", f"refs/heads/{branch}")
+
+    callsBeforeResume = len(_readToolLog(logPath))
+    result = resumeRelease(ReleaseOptions(resume=True), projectRoot=repo)
+    assert result.newVersion == "1.3.0"
+    assert result.tagName == "v1.3.0"
+    assert len(_readToolLog(logPath)) == callsBeforeResume
+    assert loadPendingRelease(repo) is None
+    assert "refs/tags/v1.3.0" in _git(repo, "ls-remote", "origin")
+
+
+def test_resume_after_partial_twine_upload_failure(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Preserve dist/ and resume remaining files with --skip-existing when twine fails mid-upload."""
+    repo, _ = _createSampleRepo(tmp_path, name="partialdemo")
+    (repo / "secrets.json").write_text(json.dumps({"pypi.org release key": "pypi-live"}), encoding="utf-8")
+    # Wheel uploads first (sorted order); fail on the second file (.tar.gz)
+    logPath = _installFakeTooling(monkeypatch, tmp_path, failUploadSuffix=".tar.gz")
+
+    with pytest.raises(ReleaseError, match=r"(?s)PARTIALLY uploaded.*tablish resume"):
+        createRelease(ReleaseOptions(bump="bugfix"), projectRoot=repo)
+
+    # Version bump and dist/ must be preserved, and pending state must record stage='upload'
+    assert (repo / "semver.txt").read_text(encoding="utf-8") == "1.2.4"
+    assert (repo / "dist" / "demo-1.2.4.tar.gz").is_file()
+    pending = loadPendingRelease(repo)
+    assert pending is not None
+    assert pending.stage == "upload"
+    assert pending.uploadedFiles == ("dist/demo-1.2.4-py3-none-any.whl",)
+    assert pending.remainingFiles == ("dist/demo-1.2.4.tar.gz",)
+
+    # Starting a new release is blocked while partial upload is pending
+    with pytest.raises(ReleaseError, match="partially uploaded"):
+        createRelease(ReleaseOptions(bump="bugfix"), projectRoot=repo)
+
+    # `tablish info` reports the partial upload pending resume
+    infoMeta = collectReleaseMetadata(ReleaseOptions(info=True), projectRoot=repo)
+    infoByKey = {item.key: item for item in infoMeta.items}
+    assert infoByKey["pending-resume"].status == "warning"
+    assert "partially uploaded" in infoByKey["pending-resume"].value
+
+    # `tablish resume --dry-run` previews remaining upload without mutating state
+    dryMessages: list[str] = []
+    dryResult = resumeRelease(ReleaseOptions(resume=True, dryRun=True), projectRoot=repo, onMessage=dryMessages.append)
+    assert dryResult.dryRun is True
+    assert any("--skip-existing" in msg and "demo-1.2.4.tar.gz" in msg for msg in dryMessages)
+    assert loadPendingRelease(repo) is not None
+
+    # Failing again on resume suggests `tablish resume --verbose-pypi` and keeps state
+    retryMessages: list[str] = []
+    with pytest.raises(ReleaseError, match="tablish resume"):
+        resumeRelease(ReleaseOptions(resume=True), projectRoot=repo, onMessage=retryMessages.append)
+    assert any("tablish resume --verbose-pypi" in msg for msg in retryMessages)
+    assert loadPendingRelease(repo) is not None
+
+    # Fix upload issue and resume with --verbose-pypi: uploads only remaining file with --skip-existing, cleans dist/, commits/tags/pushes
+    _installFakeTooling(monkeypatch, tmp_path, recordLog=logPath)
+    callsBeforeResume = len(_readToolLog(logPath))
+    result = resumeRelease(ReleaseOptions(resume=True, verbosePypi=True), projectRoot=repo)
+
+    assert result.newVersion == "1.2.4"
+    assert result.tagName == "v1.2.4"
+    assert result.builtFiles == (Path("dist/demo-1.2.4.tar.gz"),)
+    assert not (repo / "dist").exists()
+    assert loadPendingRelease(repo) is None
+    assert _git(repo, "log", "-1", "--format=%s") == "Bump semver to 1.2.4"
+    assert "refs/tags/v1.2.4" in _git(repo, "ls-remote", "origin")
+
+    resumeCalls = _readToolLog(logPath)[callsBeforeResume:]
+    assert [call["tool"] for call in resumeCalls] == ["twine"]
+    resumeArgs = resumeCalls[0]["args"]
+    assert isinstance(resumeArgs, list)
+    assert resumeArgs[:3] == ["upload", "--verbose", "--skip-existing"]
+    assert resumeArgs[-1].endswith("demo-1.2.4.tar.gz")
+
+
+def test_version_write_rollback_and_post_upload_cleanup_failure_resumes(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Roll back earlier generated files if writing semver fails, and save git resume state before cleanup."""
+    pyproject = (
+        '[project]\nname = "windowdemo"\n\n'
+        + "[tool.tablish]\n"
+        + 'project-name = "windowdemo"\n\n'
+        + "[[tool.tablish.generated-files]]\n"
+        + 'path = "generated/version.txt"\n'
+        + 'template = "{version}"\n'
+    )
+    repo, _ = _createSampleRepo(tmp_path, name="windowdemo", pyprojectBody=pyproject)
+    (repo / "secrets.json").write_text(json.dumps({"pypi.org release key": "pypi-live"}), encoding="utf-8")
+    _installFakeTooling(monkeypatch, tmp_path)
+
+    # Simulate failure when writing semver.txt after generated/version.txt was already written
+    realWriteText = Path.write_text
+    semverPath = (repo / "semver.txt").resolve()
+
+    def _failSemverWrite(
+        self: Path,
+        data: str,
+        encoding: str | None = None,
+        errors: str | None = None,
+        newline: str | None = None,
+    ) -> int:
+        if self.resolve() == semverPath and data == "1.2.4":
+            msg = "simulated disk error"
+            raise OSError(msg)
+        return realWriteText(self, data, encoding=encoding, errors=errors, newline=newline)
+
+    monkeypatch.setattr(Path, "write_text", _failSemverWrite)
+    with pytest.raises(OSError, match="simulated disk error"):
+        createRelease(ReleaseOptions(bump="bugfix"), projectRoot=repo)
+    monkeypatch.setattr(Path, "write_text", realWriteText)
+
+    assert (repo / "semver.txt").read_text(encoding="utf-8") == "1.2.3"
+    assert not (repo / "generated" / "version.txt").exists()
+    assert loadPendingRelease(repo) is None
+
+    # Simulate failure in cleanBuildArtifacts right after upload succeeds: resume state must already be saved!
+    realClean = releaseMod.cleanBuildArtifacts
+    cleanCalls = 0
+
+    def _failSecondClean(projectRoot: Path, buildDirs: t.Sequence[str]) -> None:
+        nonlocal cleanCalls
+        cleanCalls += 1
+        if cleanCalls == 2:
+            msg = "simulated cleanup failure"
+            raise OSError(msg)
+        realClean(projectRoot, buildDirs)
+
+    monkeypatch.setattr(releaseMod, "cleanBuildArtifacts", _failSecondClean)
+    with pytest.raises(OSError, match="simulated cleanup failure"):
+        createRelease(ReleaseOptions(bump="bugfix"), projectRoot=repo)
+    monkeypatch.setattr(releaseMod, "cleanBuildArtifacts", realClean)
+
+    pending = loadPendingRelease(repo)
+    assert pending is not None
+    assert pending.stage == "git"
+    assert (repo / "dist").exists()
+
+    # Resuming cleans leftover dist/ and finishes git commit/tag/push
+    result = resumeRelease(ReleaseOptions(resume=True), projectRoot=repo)
+    assert result.newVersion == "1.2.4"
+    assert not (repo / "dist").exists()
+    assert loadPendingRelease(repo) is None
+    assert "refs/tags/v1.2.4" in _git(repo, "ls-remote", "origin")

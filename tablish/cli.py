@@ -18,6 +18,7 @@ from .release import (
     collectReleaseMetadata,
     createRelease,
     parseSemver,
+    resumeRelease,
 )
 
 _BUMP_TYPES: t.Final[dict[str, t.BumpType]] = {
@@ -161,10 +162,10 @@ def _buildArgParser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "target",
-        metavar="{break,feature,bugfix,major,minor,patch,MAJOR.MINOR.PATCH,info}",
+        metavar="{break,feature,bugfix,major,minor,patch,MAJOR.MINOR.PATCH,info,resume}",
         help=(
             "Bump type (break/major, feature/minor, bugfix/patch), explicit MAJOR.MINOR.PATCH version, "
-            + "or 'info' to print publish metadata."
+            + "'info' to print publish metadata, or 'resume' to finish an interrupted upload or git release."
         ),
     )
     parser.add_argument(
@@ -221,16 +222,19 @@ def parseArgs(argv: t.Sequence[str] | None = None) -> tuple[ReleaseOptions, Path
 
     rawTarget: str = args.target
     isInfo = rawTarget == "info"
-    bump: t.BumpType | None = None if isInfo else _BUMP_TYPES.get(rawTarget)
+    isResume = rawTarget == "resume"
+    bump: t.BumpType | None = None if (isInfo or isResume) else _BUMP_TYPES.get(rawTarget)
     explicitVersion: t.Semver | None = None
-    if not isInfo and bump is None:
+    if not isInfo and not isResume and bump is None:
         try:
             explicitVersion = parseSemver(rawTarget)
         except ReleaseError:
             parser.error(
                 f"invalid release target {rawTarget!r}: expected 'break'/'major', "
-                + "'feature'/'minor', 'bugfix'/'patch', a MAJOR.MINOR.PATCH version, or 'info'.",
+                + "'feature'/'minor', 'bugfix'/'patch', a MAJOR.MINOR.PATCH version, 'info', or 'resume'.",
             )
+    if isResume and args.test:
+        parser.error("cannot combine 'resume' with --test.")
 
     options = ReleaseOptions(
         bump=bump,
@@ -241,6 +245,7 @@ def parseArgs(argv: t.Sequence[str] | None = None) -> tuple[ReleaseOptions, Path
         noTag=bool(args.no_tag),
         verbosePypi=bool(args.verbose_pypi),
         info=isInfo,
+        resume=isResume,
     )
     return (options, args.project_dir)
 
@@ -252,6 +257,9 @@ def main(argv: t.Sequence[str] | None = None) -> int:
         if options.info:
             metadata = collectReleaseMetadata(options, projectRoot=projectDir)
             print(formatReleaseMetadata(metadata, useColor=supportsColor(sys.stdout)))
+            return 0
+        if options.resume:
+            resumeRelease(options, projectRoot=projectDir, onMessage=print)
             return 0
         createRelease(options, projectRoot=projectDir, onMessage=print)
     except ReleaseError as exc:
