@@ -127,6 +127,7 @@ select = [
 
 [tool.ruff.lint.per-file-ignores]
 "tablish/cli.py" = ["T201"]              # CLI prints progress and errors
+"tablish/git.py" = ["S603", "S607"]      # git helpers invoke git subprocesses
 "tablish/release.py" = ["S603", "S607"]  # release runner invokes git/lint/build/twine
 "tests/*.py" = ["INP001", "S603", "S607"]
 

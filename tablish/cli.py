@@ -11,15 +11,8 @@ from pathlib import Path
 
 from . import t
 from .config import ReleaseError
-from .release import (
-    MetadataItem,
-    ReleaseMetadata,
-    ReleaseOptions,
-    collectReleaseMetadata,
-    createRelease,
-    parseSemver,
-    resumeRelease,
-)
+from .info import MetadataItem, ReleaseMetadata, collectReleaseMetadata
+from .release import ReleaseOptions, createRelease, parseSemver, resumeRelease
 
 _BUMP_TYPES: t.Final[dict[str, t.BumpType]] = {
     "break": "break",
@@ -29,6 +22,8 @@ _BUMP_TYPES: t.Final[dict[str, t.BumpType]] = {
     "bugfix": "bugfix",
     "patch": "patch",
 }
+
+_VALUE_COLUMN_WIDTH: t.Final[int] = 38
 
 _ANSI_RESET: t.Final[str] = "\033[0m"
 _ANSI_BOLD: t.Final[str] = "\033[1m"
@@ -41,14 +36,27 @@ _ANSI_MAGENTA_BOLD: t.Final[str] = "\033[1;35m"
 _ANSI_CYAN: t.Final[str] = "\033[36m"
 _ANSI_CYAN_BOLD: t.Final[str] = "\033[1;36m"
 
+_SOURCE_BADGE_STYLES: t.Final[dict[t.MetadataSource, tuple[str, str]]] = {
+    "explicit": ("explicit", _ANSI_GREEN_BOLD),
+    "cli": ("cli", _ANSI_MAGENTA_BOLD),
+    "inferred": ("default", _ANSI_CYAN),
+    "default": ("default", _ANSI_DIM),
+}
+_STATUS_BADGE_STYLES: t.Final[dict[t.MetadataStatus, tuple[str, str]]] = {
+    "error": ("error", _ANSI_RED_BOLD),
+    "warning": ("warning", _ANSI_YELLOW),
+    "ok": ("ok", _ANSI_GREEN),
+}
+
 
 def supportsColor(stream: t.SupportsIsatty | None = None) -> bool:
     """Return True if ANSI color output is supported for stream."""
     if os.environ.get("NO_COLOR"):
         return False
-    forceColor = os.environ.get("FORCE_COLOR") or os.environ.get("CLICOLOR_FORCE")
-    if forceColor and forceColor != "0":
-        return True
+    for envVar in ("FORCE_COLOR", "CLICOLOR_FORCE"):
+        forceVal = os.environ.get(envVar)
+        if forceVal and forceVal != "0":
+            return True
     if os.environ.get("CLICOLOR") == "0":
         return False
     if os.environ.get("TERM", "") == "dumb":
@@ -74,29 +82,20 @@ def _paint(text: str, code: str, *, useColor: bool) -> str:
     return f"{code}{text}{_ANSI_RESET}"
 
 
+def _badgeLabel(kind: str, detail: str | None) -> str:
+    """Format a bracketed badge label with optional detail suffix."""
+    return f"[{kind}: {detail}]" if detail else f"[{kind}]"
+
+
 def _formatBadge(item: MetadataItem) -> tuple[str, str]:
     """Return (plainBadgeText, ansiColorCode) for a metadata item's provenance or status."""
-    if item.source == "explicit":
-        label = f"[explicit: {item.sourceDetail}]" if item.sourceDetail else "[explicit]"
-        return (label, _ANSI_GREEN_BOLD)
-    if item.source == "cli":
-        label = f"[cli: {item.sourceDetail}]" if item.sourceDetail else "[cli]"
-        return (label, _ANSI_MAGENTA_BOLD)
-    if item.source == "inferred":
-        label = f"[default: {item.sourceDetail}]" if item.sourceDetail else "[default]"
-        return (label, _ANSI_CYAN)
-    if item.source == "default":
-        label = f"[default: {item.sourceDetail}]" if item.sourceDetail else "[default]"
-        return (label, _ANSI_DIM)
-    if item.status == "error":
-        label = f"[error: {item.sourceDetail}]" if item.sourceDetail else "[error]"
-        return (label, _ANSI_RED_BOLD)
-    if item.status == "warning":
-        label = f"[warning: {item.sourceDetail}]" if item.sourceDetail else "[warning]"
-        return (label, _ANSI_YELLOW)
-    if item.status == "ok":
-        label = f"[ok: {item.sourceDetail}]" if item.sourceDetail else "[ok]"
-        return (label, _ANSI_GREEN)
+    sourceStyle = _SOURCE_BADGE_STYLES.get(item.source)
+    if sourceStyle is not None:
+        kind, color = sourceStyle
+        return (_badgeLabel(kind, item.sourceDetail), color)
+    if item.status is not None:
+        kind, color = _STATUS_BADGE_STYLES[item.status]
+        return (_badgeLabel(kind, item.sourceDetail), color)
     if item.sourceDetail:
         return (f"[{item.sourceDetail}]", _ANSI_CYAN)
     return ("", "")
@@ -105,7 +104,6 @@ def _formatBadge(item: MetadataItem) -> tuple[str, str]:
 def formatReleaseMetadata(metadata: ReleaseMetadata, *, useColor: bool = False) -> str:
     """Format resolved publish metadata into aligned, optionally colored sections."""
     keyWidth = max((len(item.key) for item in metadata.items), default=0) + 2
-    valueWidth = 38
 
     lines: list[str] = []
     currentSection: str | None = None
@@ -117,25 +115,23 @@ def formatReleaseMetadata(metadata: ReleaseMetadata, *, useColor: bool = False) 
             currentSection = item.section
 
         paddedKey = item.key.ljust(keyWidth)
-        if item.source in ("explicit", "cli"):
-            styledKey = _paint(paddedKey, _ANSI_BOLD, useColor=useColor)
-        else:
-            styledKey = paddedKey
+        styledKey = (
+            _paint(paddedKey, _ANSI_BOLD, useColor=useColor) if item.source in ("explicit", "cli") else paddedKey
+        )
 
         valueColor = ""
         if item.status == "error":
             valueColor = _ANSI_RED_BOLD
         elif item.status == "warning":
             valueColor = _ANSI_YELLOW
+        styledValue = _paint(item.value, valueColor, useColor=useColor)
 
         badgeText, badgeColor = _formatBadge(item)
         if badgeText:
-            padSpaces = max(2, valueWidth - len(item.value))
-            styledValue = _paint(item.value, valueColor, useColor=useColor)
+            padSpaces = max(2, _VALUE_COLUMN_WIDTH - len(item.value))
             styledBadge = _paint(badgeText, badgeColor, useColor=useColor)
             lines.append(f"  {styledKey}{styledValue}{' ' * padSpaces}{styledBadge}")
         else:
-            styledValue = _paint(item.value, valueColor, useColor=useColor)
             lines.append(f"  {styledKey}{styledValue}")
 
         for detail in item.details:
@@ -222,11 +218,20 @@ def parseArgs(argv: t.Sequence[str] | None = None) -> tuple[ReleaseOptions, Path
     args = parser.parse_args(argv)
 
     rawTarget: str = args.target
-    isInfo = rawTarget == "info"
-    isResume = rawTarget == "resume"
-    bump: t.BumpType | None = None if (isInfo or isResume) else _BUMP_TYPES.get(rawTarget)
+    isInfo = False
+    isResume = False
+    bump: t.BumpType | None = None
     explicitVersion: t.Semver | None = None
-    if not isInfo and not isResume and bump is None:
+
+    if rawTarget == "info":
+        isInfo = True
+    elif rawTarget == "resume":
+        isResume = True
+        if args.test:
+            parser.error("cannot combine 'resume' with --test.")
+    elif rawTarget in _BUMP_TYPES:
+        bump = _BUMP_TYPES[rawTarget]
+    else:
         try:
             explicitVersion = parseSemver(rawTarget)
         except ReleaseError:
@@ -234,8 +239,6 @@ def parseArgs(argv: t.Sequence[str] | None = None) -> tuple[ReleaseOptions, Path
                 f"invalid release target {rawTarget!r}: expected 'break'/'major', "
                 + "'feature'/'minor', 'bugfix'/'patch', a MAJOR.MINOR.PATCH version, 'info', or 'resume'.",
             )
-    if isResume and args.test:
-        parser.error("cannot combine 'resume' with --test.")
 
     options = ReleaseOptions(
         bump=bump,

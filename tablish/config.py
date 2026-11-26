@@ -11,6 +11,7 @@ import kdl
 
 from . import t
 
+_PYPROJECT_FILENAME: t.Final[str] = "pyproject.toml"
 TABLISH_KDL_FILENAME: t.Final[str] = "tablish.kdl"
 DEFAULT_TEST_PYPI_URL: t.Final[str] = "https://test.pypi.org/legacy/"
 DEFAULT_SEMVER_FILE: t.Final[str] = "semver.txt"
@@ -22,31 +23,6 @@ DEFAULT_CHECK_MANIFEST_ARGS: t.Final[tuple[str, ...]] = ("--no-build-isolation",
 DEFAULT_TAG_FORMAT: t.Final[str] = "v{version}"
 DEFAULT_TAG_MESSAGE: t.Final[str] = "Release {version}"
 DEFAULT_COMMIT_MESSAGE: t.Final[str] = "Bump semver to {version}"
-
-_KNOWN_CONFIG_KEYS: t.Final[frozenset[str]] = frozenset(
-    {
-        "project-name",
-        "semver-file",
-        "secrets-file",
-        "pypi-secret-key",
-        "test-pypi-secret-key",
-        "pypi-url",
-        "test-pypi-url",
-        "build-dirs",
-        "lint-command",
-        "check-manifest",
-        "check-manifest-args",
-        "tag",
-        "tag-format",
-        "tag-message",
-        "commit-message",
-        "generated-files",
-    },
-)
-
-_KNOWN_KDL_NODES: t.Final[frozenset[str]] = _KNOWN_CONFIG_KEYS | frozenset({"generated-file"})
-_KNOWN_GENERATED_FILE_KEYS: t.Final[frozenset[str]] = frozenset({"path", "command", "template"})
-_GENERATED_FILE_WRAPPER_NAMES: t.Final[frozenset[str]] = frozenset({"file", "generated-file", "-"})
 
 _SCALAR_NON_EMPTY_STRING_KEYS: t.Final[frozenset[str]] = frozenset(
     {
@@ -63,6 +39,18 @@ _SCALAR_NON_EMPTY_STRING_KEYS: t.Final[frozenset[str]] = frozenset(
 _SCALAR_OPTIONAL_STRING_KEYS: t.Final[frozenset[str]] = frozenset({"project-name", "pypi-url"})
 _SCALAR_BOOL_KEYS: t.Final[frozenset[str]] = frozenset({"check-manifest", "tag"})
 _STRING_LIST_KEYS: t.Final[frozenset[str]] = frozenset({"build-dirs", "check-manifest-args"})
+
+# Derived from the per-kind key groups above so TOML validation and KDL dispatch cannot drift apart.
+_KNOWN_CONFIG_KEYS: t.Final[frozenset[str]] = (
+    _SCALAR_NON_EMPTY_STRING_KEYS
+    | _SCALAR_OPTIONAL_STRING_KEYS
+    | _SCALAR_BOOL_KEYS
+    | _STRING_LIST_KEYS
+    | frozenset({"lint-command", "generated-files"})
+)
+_KNOWN_KDL_NODES: t.Final[frozenset[str]] = _KNOWN_CONFIG_KEYS | frozenset({"generated-file"})
+_KNOWN_GENERATED_FILE_KEYS: t.Final[frozenset[str]] = frozenset({"path", "command", "template"})
+_GENERATED_FILE_WRAPPER_NAMES: t.Final[frozenset[str]] = frozenset({"file", "generated-file", "-"})
 
 
 class ReleaseError(Exception):
@@ -110,26 +98,29 @@ class TablishConfig:
         """Return whether a config key was explicitly set, inferred, or defaulted."""
         if key in self.explicitKeys:
             return "explicit"
-        if any(inferredKey == key for inferredKey, _ in self.inferredSources):
+        if self.inferredOrigin(key) is not None:
             return "inferred"
         return "default"
 
     def explicitOrigin(self, key: str) -> str | None:
         """Return the config file origin ('tablish.kdl' or 'pyproject.toml') for an explicit key."""
-        for explicitKey, origin in self.explicitSources:
-            if explicitKey == key:
-                return origin
-        return None
+        return next((origin for explicitKey, origin in self.explicitSources if explicitKey == key), None)
 
     def inferredOrigin(self, key: str) -> str | None:
         """Return the pyproject.toml origin string for an inferred config key, if any."""
-        for inferredKey, origin in self.inferredSources:
-            if inferredKey == key:
-                return origin
-        return None
+        return next((origin for inferredKey, origin in self.inferredSources if inferredKey == key), None)
+
+    def originOf(self, key: str) -> str | None:
+        """Return the explicit or inferred origin label for key, if any."""
+        return self.explicitOrigin(key) or self.inferredOrigin(key)
 
 
-def _keyLabel(keyName: str, origin: str = "pyproject.toml") -> str:
+# ---------------------------------------------------------------------------
+# Scalar & structured value validators
+# ---------------------------------------------------------------------------
+
+
+def _keyLabel(keyName: str, origin: str = _PYPROJECT_FILENAME) -> str:
     """Format a user-facing config key reference for error messages."""
     if origin == TABLISH_KDL_FILENAME:
         return f"{TABLISH_KDL_FILENAME}: {keyName}"
@@ -179,14 +170,13 @@ def _parseStringList(raw: object, keyLabel: str, *, allowEmpty: bool = True) -> 
     if not isinstance(raw, list) or not all(isinstance(item, str) for item in raw):
         msg = f"{keyLabel} must be a list of strings."
         raise ReleaseError(msg)
-    items = tuple(item for item in raw if item)
-    if len(items) != len(raw):
+    if any(not item for item in raw):
         msg = f"{keyLabel} must not contain empty strings."
         raise ReleaseError(msg)
-    if not allowEmpty and not items:
+    if not allowEmpty and not raw:
         msg = f"{keyLabel} must not be empty."
         raise ReleaseError(msg)
-    return items
+    return tuple(raw)
 
 
 def _parseCommand(raw: object, keyLabel: str) -> tuple[str, ...]:
@@ -214,34 +204,6 @@ def _validateVersionTemplate(template: str, keyLabel: str) -> str:
     return template
 
 
-def _inferProjectName(pyprojectData: t.Mapping[str, t.Any]) -> str | None:
-    """Infer the default project name from [project].name when present."""
-    projectTable = pyprojectData.get("project")
-    if isinstance(projectTable, dict):
-        name = projectTable.get("name")
-        if isinstance(name, str) and name.strip():
-            return name.strip()
-    return None
-
-
-def _inferSemverFile(pyprojectData: t.Mapping[str, t.Any]) -> Path | None:
-    """Infer the version file from [tool.setuptools.dynamic].version.file when present."""
-    toolTable = pyprojectData.get("tool")
-    if isinstance(toolTable, dict):
-        setuptoolsTable = toolTable.get("setuptools")
-        if isinstance(setuptoolsTable, dict):
-            dynamicTable = setuptoolsTable.get("dynamic")
-            if isinstance(dynamicTable, dict):
-                versionSpec = dynamicTable.get("version")
-                if isinstance(versionSpec, dict):
-                    fileSpec = versionSpec.get("file")
-                    if isinstance(fileSpec, str) and fileSpec.strip():
-                        return _validateRelativePath(fileSpec, "[tool.setuptools.dynamic].version.file")
-                    if isinstance(fileSpec, list) and len(fileSpec) == 1 and isinstance(fileSpec[0], str):
-                        return _validateRelativePath(fileSpec[0], "[tool.setuptools.dynamic].version.file")
-    return None
-
-
 def _parseLintCommand(raw: object, keyLabel: str) -> tuple[bool, tuple[str, ...] | None]:
     """Parse lint-command into (lintEnabled, lintCommand)."""
     if raw is False:
@@ -260,7 +222,7 @@ def _parseLintCommand(raw: object, keyLabel: str) -> tuple[bool, tuple[str, ...]
     raise ReleaseError(msg)
 
 
-def _parseGeneratedFiles(raw: object, origin: str = "pyproject.toml") -> tuple[GeneratedFileConfig, ...]:
+def _parseGeneratedFiles(raw: object, origin: str = _PYPROJECT_FILENAME) -> tuple[GeneratedFileConfig, ...]:
     """Parse generated-files entries from pyproject.toml or tablish.kdl."""
     if not isinstance(raw, list):
         msg = f"{_keyLabel('generated-files', origin)} must be an array of tables."
@@ -305,6 +267,73 @@ def _parseGeneratedFiles(raw: object, origin: str = "pyproject.toml") -> tuple[G
     return tuple(entries)
 
 
+# ---------------------------------------------------------------------------
+# pyproject.toml metadata inference
+# ---------------------------------------------------------------------------
+
+
+def _getNestedMapping(data: t.Mapping[str, t.Any], *keys: str) -> t.Mapping[str, t.Any] | None:
+    """Traverse nested mapping keys, returning None if any intermediate entry is missing or not a mapping."""
+    current: object = data
+    for key in keys:
+        if not isinstance(current, t.Mapping):
+            return None
+        current = current.get(key)
+    return current if isinstance(current, t.Mapping) else None
+
+
+def _inferProjectName(pyprojectData: t.Mapping[str, t.Any]) -> str | None:
+    """Infer the default project name from [project].name when present."""
+    projectTable = _getNestedMapping(pyprojectData, "project")
+    if projectTable is None:
+        return None
+    name = projectTable.get("name")
+    if isinstance(name, str) and name.strip():
+        return name.strip()
+    return None
+
+
+def _inferSemverFile(pyprojectData: t.Mapping[str, t.Any]) -> Path | None:
+    """Infer the version file from [tool.setuptools.dynamic].version.file when present."""
+    versionSpec = _getNestedMapping(pyprojectData, "tool", "setuptools", "dynamic", "version")
+    if versionSpec is None:
+        return None
+    fileSpec = versionSpec.get("file")
+    label = "[tool.setuptools.dynamic].version.file"
+    if isinstance(fileSpec, str) and fileSpec.strip():
+        return _validateRelativePath(fileSpec, label)
+    if isinstance(fileSpec, list) and len(fileSpec) == 1 and isinstance(fileSpec[0], str):
+        return _validateRelativePath(fileSpec[0], label)
+    return None
+
+
+def _extractPyprojectTablishTable(pyprojectData: t.Mapping[str, t.Any]) -> tuple[dict[str, t.Any], bool]:
+    """Validate and extract the optional [tool.tablish] table from pyproject.toml data."""
+    toolTable = pyprojectData.get("tool")
+    if toolTable is not None and not isinstance(toolTable, t.Mapping):
+        msg = "Invalid pyproject.toml: [tool] must be a table."
+        raise ReleaseError(msg)
+
+    rawTablish = toolTable.get("tablish") if isinstance(toolTable, t.Mapping) else None
+    if rawTablish is None:
+        return ({}, False)
+    if not isinstance(rawTablish, t.Mapping):
+        msg = "Invalid pyproject.toml: [tool.tablish] must be a table."
+        raise ReleaseError(msg)
+
+    table = dict(rawTablish)
+    unknownKeys = sorted(set(table) - _KNOWN_CONFIG_KEYS)
+    if unknownKeys:
+        msg = f"Unknown key(s) in [tool.tablish]: {', '.join(unknownKeys)}"
+        raise ReleaseError(msg)
+    return (table, True)
+
+
+# ---------------------------------------------------------------------------
+# tablish.kdl parsing
+# ---------------------------------------------------------------------------
+
+
 def _ensureNoNodeTag(node: kdl.Node, context: str) -> None:
     """Reject unexpected KDL type annotations on config nodes."""
     if node.tag is not None:
@@ -341,27 +370,18 @@ def _parseKdlStringListNode(node: kdl.Node, keyLabel: str) -> list[object]:
             if child.name != "-" or child.props or child.nodes or len(child.args) != 1:
                 msg = f"Child nodes of {keyLabel} must be '-' nodes with a single string argument."
                 raise ReleaseError(msg)
-            item: object = child.args[0]
-            items.append(item)
+            items.append(child.args[0])
         return items
     return list(node.args)
 
 
 def _parseKdlCommandNode(node: kdl.Node, keyLabel: str) -> object:
     """Extract a command value (scalar arg, argv list, or '-' children) from a KDL node."""
-    _ensureNoNodeTag(node, keyLabel)
-    if node.props:
-        msg = f"{keyLabel} does not accept properties."
-        raise ReleaseError(msg)
-    if node.args and node.nodes:
-        msg = f"{keyLabel} cannot specify both arguments and child nodes."
-        raise ReleaseError(msg)
-    if node.nodes:
-        return _parseKdlStringListNode(node, keyLabel)
-    if len(node.args) == 1:
-        value: object = node.args[0]
-        return value
-    return list(node.args)
+    items = _parseKdlStringListNode(node, keyLabel)
+    # Unwrap a single positional argument so booleans, null, or shell-split strings work naturally.
+    if not node.nodes and len(items) == 1:
+        return items[0]
+    return items
 
 
 def _parseKdlGeneratedFileEntry(
@@ -380,6 +400,8 @@ def _parseKdlGeneratedFileEntry(
     entry: dict[str, object] = {}
     if implicitPath is not None:
         if node.args:
+            # A bare child node name doubles as an implicit path, so positional args usually mean a mistyped wrapper
+            # keyword (e.g. `flie "a.txt"` instead of `file "a.txt"`).
             msg = (
                 f"Unknown child node {node.name!r} in {_keyLabel('generated-files', TABLISH_KDL_FILENAME)} "
                 + "(unexpected positional arguments)."
@@ -391,15 +413,13 @@ def _parseKdlGeneratedFileEntry(
             msg = f"{entryLabel} expects at most one positional path argument."
             raise ReleaseError(msg)
         if len(node.args) == 1:
-            pathArg: object = node.args[0]
-            entry["path"] = pathArg
+            entry["path"] = node.args[0]
 
     for propKey, propVal in node.props.items():
         if propKey in entry:
             msg = f"Duplicate '{propKey}' in {entryLabel}."
             raise ReleaseError(msg)
-        propValue: object = propVal
-        entry[propKey] = propValue
+        entry[propKey] = propVal
 
     for child in node.nodes:
         childLabel = f"{entryLabel}.{child.name}"
@@ -416,6 +436,22 @@ def _parseKdlGeneratedFileEntry(
             entry[child.name] = _parseKdlScalarArg(child, childLabel)
 
     return entry
+
+
+def _parseKdlGeneratedFilesBlock(node: kdl.Node, startIndex: int) -> list[dict[str, object]]:
+    """Parse child entries inside a KDL `generated-files { ... }` block."""
+    blockLabel = _keyLabel("generated-files", TABLISH_KDL_FILENAME)
+    _ensureNoNodeTag(node, blockLabel)
+    if node.args or node.props:
+        msg = f"{blockLabel} does not accept arguments or properties; use child nodes."
+        raise ReleaseError(msg)
+
+    entries: list[dict[str, object]] = []
+    for offset, child in enumerate(node.nodes):
+        entryLabel = _keyLabel(f"generated-files[{startIndex + offset}]", TABLISH_KDL_FILENAME)
+        implicitPath = None if child.name in _GENERATED_FILE_WRAPPER_NAMES else child.name
+        entries.append(_parseKdlGeneratedFileEntry(child, implicitPath=implicitPath, entryLabel=entryLabel))
+    return entries
 
 
 def _parseKdlDocument(doc: kdl.Document) -> dict[str, t.Any]:
@@ -437,18 +473,8 @@ def _parseKdlDocument(doc: kdl.Document) -> dict[str, t.Any]:
             continue
 
         if node.name == "generated-files":
-            blockLabel = _keyLabel("generated-files", TABLISH_KDL_FILENAME)
-            _ensureNoNodeTag(node, blockLabel)
-            if node.args or node.props:
-                msg = f"{blockLabel} does not accept arguments or properties; use child nodes."
-                raise ReleaseError(msg)
             hasGeneratedFiles = True
-            for child in node.nodes:
-                entryLabel = _keyLabel(f"generated-files[{len(generatedEntries)}]", TABLISH_KDL_FILENAME)
-                implicitPath = None if child.name in _GENERATED_FILE_WRAPPER_NAMES else child.name
-                generatedEntries.append(
-                    _parseKdlGeneratedFileEntry(child, implicitPath=implicitPath, entryLabel=entryLabel),
-                )
+            generatedEntries.extend(_parseKdlGeneratedFilesBlock(node, len(generatedEntries)))
             continue
 
         if node.name in kdlTable:
@@ -463,7 +489,8 @@ def _parseKdlDocument(doc: kdl.Document) -> dict[str, t.Any]:
             kdlTable[node.name] = "" if optionalVal is None else optionalVal
         elif node.name in _STRING_LIST_KEYS:
             kdlTable[node.name] = _parseKdlStringListNode(node, keyLabel)
-        elif node.name == "lint-command":
+        else:
+            assert node.name == "lint-command"
             rawLint = _parseKdlCommandNode(node, keyLabel)
             kdlTable[node.name] = False if rawLint is None else rawLint
 
@@ -473,6 +500,24 @@ def _parseKdlDocument(doc: kdl.Document) -> dict[str, t.Any]:
     return kdlTable
 
 
+def _parseKdlInput(kdlData: kdl.Document | str) -> dict[str, t.Any]:
+    """Parse a raw KDL string or pre-parsed Document into a config dictionary."""
+    if isinstance(kdlData, str):
+        try:
+            kdlDoc = kdl.parse(kdlData)
+        except kdl.ParseError as exc:
+            msg = f"Error parsing {TABLISH_KDL_FILENAME}: {exc}"
+            raise ReleaseError(msg) from exc
+    else:
+        kdlDoc = kdlData
+    return _parseKdlDocument(kdlDoc)
+
+
+# ---------------------------------------------------------------------------
+# Public config parsing & disk loader
+# ---------------------------------------------------------------------------
+
+
 def parseConfigData(
     pyprojectData: t.Mapping[str, t.Any] | None = None,
     kdlData: kdl.Document | str | None = None,
@@ -480,63 +525,45 @@ def parseConfigData(
     """Parse decoded pyproject.toml and/or tablish.kdl data into a validated TablishConfig."""
     hasPyproject = pyprojectData is not None
     pyprojectMap: t.Mapping[str, t.Any] = pyprojectData if pyprojectData is not None else {}
-
-    toolTable = pyprojectMap.get("tool")
-    if toolTable is not None and not isinstance(toolTable, dict):
-        msg = "Invalid pyproject.toml: [tool] must be a table."
-        raise ReleaseError(msg)
-
-    rawTablish = toolTable.get("tablish") if isinstance(toolTable, dict) else None
-    hasTablishTable = rawTablish is not None
-    if rawTablish is None:
-        pyprojectTablishTable: dict[str, t.Any] = {}
-    elif isinstance(rawTablish, dict):
-        pyprojectTablishTable = rawTablish
-    else:
-        msg = "Invalid pyproject.toml: [tool.tablish] must be a table."
-        raise ReleaseError(msg)
-
-    unknownPyprojectKeys = sorted(set(pyprojectTablishTable) - _KNOWN_CONFIG_KEYS)
-    if unknownPyprojectKeys:
-        msg = f"Unknown key(s) in [tool.tablish]: {', '.join(unknownPyprojectKeys)}"
-        raise ReleaseError(msg)
+    pyprojectTablishTable, hasTablishTable = _extractPyprojectTablishTable(pyprojectMap)
 
     hasTablishKdl = kdlData is not None
-    kdlTable: dict[str, t.Any] = {}
-    if kdlData is not None:
-        if isinstance(kdlData, str):
-            try:
-                kdlDoc = kdl.parse(kdlData)
-            except kdl.ParseError as exc:
-                msg = f"Error parsing {TABLISH_KDL_FILENAME}: {exc}"
-                raise ReleaseError(msg) from exc
-        else:
-            kdlDoc = kdlData
-        kdlTable = _parseKdlDocument(kdlDoc)
+    kdlTable = _parseKdlInput(kdlData) if kdlData is not None else {}
 
     tablishTable: dict[str, t.Any] = dict(pyprojectTablishTable)
-    keyOrigins: dict[str, str] = {key: "pyproject.toml" for key in pyprojectTablishTable}
+    keyOrigins: dict[str, str] = {key: _PYPROJECT_FILENAME for key in pyprojectTablishTable}
     for key, value in kdlTable.items():
         tablishTable[key] = value
         keyOrigins[key] = TABLISH_KDL_FILENAME
 
-    explicitKeys = frozenset(tablishTable)
-    explicitSources = tuple(sorted(keyOrigins.items()))
     inferredSources: list[tuple[str, str]] = []
 
     def _label(key: str) -> str:
-        return _keyLabel(key, keyOrigins.get(key, "pyproject.toml"))
+        return _keyLabel(key, keyOrigins.get(key, _PYPROJECT_FILENAME))
+
+    def _nonEmptyStr(key: str, default: str) -> str:
+        return _parseNonEmptyString(tablishTable[key], _label(key)) if key in tablishTable else default
+
+    def _optionalStr(key: str) -> str | None:
+        return _parseOptionalString(tablishTable[key], _label(key)) if key in tablishTable else None
+
+    def _bool(key: str, *, default: bool) -> bool:
+        return _parseBool(tablishTable[key], _label(key)) if key in tablishTable else default
+
+    def _versionTemplate(key: str, default: str) -> str:
+        value = _nonEmptyStr(key, default)
+        return _validateVersionTemplate(value, _label(key)) if key in tablishTable else value
 
     if "project-name" in tablishTable:
-        projectName = _parseOptionalString(tablishTable["project-name"], _label("project-name"))
+        projectName = _optionalStr("project-name")
     else:
         projectName = _inferProjectName(pyprojectMap)
         if projectName is not None:
             inferredSources.append(("project-name", "[project].name"))
 
     if "semver-file" in tablishTable:
-        rawSemverFile = _parseNonEmptyString(tablishTable["semver-file"], _label("semver-file"))
-        semverFile = _validateRelativePath(rawSemverFile, _label("semver-file"))
+        semverLabel = _label("semver-file")
+        semverFile = _validateRelativePath(_parseNonEmptyString(tablishTable["semver-file"], semverLabel), semverLabel)
     else:
         inferredSemver = _inferSemverFile(pyprojectMap)
         if inferredSemver is not None:
@@ -545,27 +572,7 @@ def parseConfigData(
         else:
             semverFile = Path(DEFAULT_SEMVER_FILE)
 
-    if "secrets-file" in tablishTable:
-        secretsFile = Path(_parseNonEmptyString(tablishTable["secrets-file"], _label("secrets-file")))
-    else:
-        secretsFile = Path(DEFAULT_SECRETS_FILE)
-
-    pypiSecretKey = (
-        _parseNonEmptyString(tablishTable["pypi-secret-key"], _label("pypi-secret-key"))
-        if "pypi-secret-key" in tablishTable
-        else DEFAULT_PYPI_SECRET_KEY
-    )
-    testPypiSecretKey = (
-        _parseNonEmptyString(tablishTable["test-pypi-secret-key"], _label("test-pypi-secret-key"))
-        if "test-pypi-secret-key" in tablishTable
-        else DEFAULT_TEST_PYPI_SECRET_KEY
-    )
-    pypiUrl = _parseOptionalString(tablishTable["pypi-url"], _label("pypi-url")) if "pypi-url" in tablishTable else None
-    testPypiUrl = (
-        _parseNonEmptyString(tablishTable["test-pypi-url"], _label("test-pypi-url"))
-        if "test-pypi-url" in tablishTable
-        else DEFAULT_TEST_PYPI_URL
-    )
+    secretsFile = Path(_nonEmptyStr("secrets-file", DEFAULT_SECRETS_FILE))
 
     if "build-dirs" in tablishTable:
         buildDirsLabel = _label("build-dirs")
@@ -579,41 +586,10 @@ def parseConfigData(
     else:
         lintEnabled, lintCommand = (True, None)
 
-    checkManifest = (
-        _parseBool(tablishTable["check-manifest"], _label("check-manifest"))
-        if "check-manifest" in tablishTable
-        else True
-    )
     checkManifestArgs = (
         _parseStringList(tablishTable["check-manifest-args"], _label("check-manifest-args"), allowEmpty=True)
         if "check-manifest-args" in tablishTable
         else DEFAULT_CHECK_MANIFEST_ARGS
-    )
-
-    tag = _parseBool(tablishTable["tag"], _label("tag")) if "tag" in tablishTable else True
-    tagFormat = _validateVersionTemplate(
-        (
-            _parseNonEmptyString(tablishTable["tag-format"], _label("tag-format"))
-            if "tag-format" in tablishTable
-            else DEFAULT_TAG_FORMAT
-        ),
-        _label("tag-format"),
-    )
-    tagMessage = _validateVersionTemplate(
-        (
-            _parseNonEmptyString(tablishTable["tag-message"], _label("tag-message"))
-            if "tag-message" in tablishTable
-            else DEFAULT_TAG_MESSAGE
-        ),
-        _label("tag-message"),
-    )
-    commitMessage = _validateVersionTemplate(
-        (
-            _parseNonEmptyString(tablishTable["commit-message"], _label("commit-message"))
-            if "commit-message" in tablishTable
-            else DEFAULT_COMMIT_MESSAGE
-        ),
-        _label("commit-message"),
     )
 
     generatedFiles = (
@@ -626,37 +602,37 @@ def parseConfigData(
         projectName=projectName,
         semverFile=semverFile,
         secretsFile=secretsFile,
-        pypiSecretKey=pypiSecretKey,
-        testPypiSecretKey=testPypiSecretKey,
-        pypiUrl=pypiUrl,
-        testPypiUrl=testPypiUrl,
+        pypiSecretKey=_nonEmptyStr("pypi-secret-key", DEFAULT_PYPI_SECRET_KEY),
+        testPypiSecretKey=_nonEmptyStr("test-pypi-secret-key", DEFAULT_TEST_PYPI_SECRET_KEY),
+        pypiUrl=_optionalStr("pypi-url"),
+        testPypiUrl=_nonEmptyStr("test-pypi-url", DEFAULT_TEST_PYPI_URL),
         buildDirs=buildDirs,
         lintEnabled=lintEnabled,
         lintCommand=lintCommand,
-        checkManifest=checkManifest,
+        checkManifest=_bool("check-manifest", default=True),
         checkManifestArgs=checkManifestArgs,
-        tag=tag,
-        tagFormat=tagFormat,
-        tagMessage=tagMessage,
-        commitMessage=commitMessage,
+        tag=_bool("tag", default=True),
+        tagFormat=_versionTemplate("tag-format", DEFAULT_TAG_FORMAT),
+        tagMessage=_versionTemplate("tag-message", DEFAULT_TAG_MESSAGE),
+        commitMessage=_versionTemplate("commit-message", DEFAULT_COMMIT_MESSAGE),
         generatedFiles=generatedFiles,
         hasPyproject=hasPyproject,
         hasTablishTable=hasTablishTable,
         hasTablishKdl=hasTablishKdl,
-        explicitKeys=explicitKeys,
-        explicitSources=explicitSources,
+        explicitKeys=frozenset(tablishTable),
+        explicitSources=tuple(sorted(keyOrigins.items())),
         inferredSources=tuple(inferredSources),
     )
 
 
 def loadConfig(projectRoot: Path) -> TablishConfig:
     """Load and validate tablish configuration from pyproject.toml and/or tablish.kdl in projectRoot."""
-    pyprojectPath = projectRoot / "pyproject.toml"
+    pyprojectPath = projectRoot / _PYPROJECT_FILENAME
     kdlPath = projectRoot / TABLISH_KDL_FILENAME
     hasPyproject = pyprojectPath.is_file()
     hasKdl = kdlPath.is_file()
     if not hasPyproject and not hasKdl:
-        msg = f"Could not find pyproject.toml or {TABLISH_KDL_FILENAME} in {projectRoot}."
+        msg = f"Could not find {_PYPROJECT_FILENAME} or {TABLISH_KDL_FILENAME} in {projectRoot}."
         raise ReleaseError(msg)
 
     rawPyproject: dict[str, t.Any] | None = None

@@ -6,11 +6,13 @@ import json
 import os
 import subprocess
 import sys
+import textwrap
 from pathlib import Path
 
 import pytest
 
 from tablish import (
+    PENDING_RELEASE_FILENAME,
     ReleaseError,
     ReleaseOptions,
     bumpSemver,
@@ -45,6 +47,22 @@ def _git(repo: Path, *args: str) -> str:
     return result.stdout.strip()
 
 
+def _attachBareOrigin(tmpPath: Path, repo: Path, name: str, *, pushInitial: bool = False) -> Path:
+    """Create a bare origin repository, wire it up to repo, and optionally push the initial branch."""
+    originsDir = tmpPath / "origins"
+    originsDir.mkdir(exist_ok=True)
+    remoteRepo = originsDir / f"{name}.git"
+    subprocess.run(["git", "init", "--bare", str(remoteRepo)], check=True, capture_output=True)
+    _git(repo, "remote", "add", "origin", str(remoteRepo))
+    branch = _git(repo, "branch", "--show-current")
+    if pushInitial:
+        _git(repo, "push", "-u", "origin", branch)
+    else:
+        _git(repo, "config", f"branch.{branch}.remote", "origin")
+        _git(repo, "config", f"branch.{branch}.merge", f"refs/heads/{branch}")
+    return remoteRepo
+
+
 def _createSampleRepo(
     tmpPath: Path,
     *,
@@ -75,14 +93,7 @@ def _createSampleRepo(
     _git(repo, "add", ".")
     _git(repo, "commit", "-m", "Initial commit")
 
-    remoteRepo: Path | None = None
-    if withRemote:
-        remoteRepo = tmpPath / f"{name}-origin.git"
-        subprocess.run(["git", "init", "--bare", str(remoteRepo)], check=True, capture_output=True)
-        _git(repo, "remote", "add", "origin", str(remoteRepo))
-        branch = _git(repo, "branch", "--show-current")
-        _git(repo, "push", "-u", "origin", branch)
-
+    remoteRepo = _attachBareOrigin(tmpPath, repo, name, pushInitial=True) if withRemote else None
     return (repo, remoteRepo)
 
 
@@ -93,46 +104,68 @@ def _installFakeTooling(
     failUpload: bool = False,
     failUploadSuffix: str | None = None,
     recordLog: Path | None = None,
+    missingTools: t.Sequence[str] = (),
 ) -> Path:
     """Monkeypatch findToolCommand to invoke lightweight local Python scripts."""
     logPath = recordLog or (tmpPath / "tool_calls.jsonl")
 
     fakeBuild = tmpPath / "fake_build.py"
     fakeBuild.write_text(
-        "import json, pathlib, sys\n"
-        + f"log = pathlib.Path({str(logPath)!r})\n"
-        + 'with log.open("a", encoding="utf-8") as fh:\n'
-        + '    fh.write(json.dumps({"tool": "build", "args": sys.argv[1:]}) + "\\n")\n'
-        + 'ver = pathlib.Path("semver.txt").read_text(encoding="utf-8").strip()\n'
-        + 'dist = pathlib.Path("dist")\n'
-        + "dist.mkdir(exist_ok=True)\n"
-        + '(dist / f"demo-{ver}.tar.gz").write_text("sdist", encoding="utf-8")\n'
-        + '(dist / f"demo-{ver}-py3-none-any.whl").write_text("wheel", encoding="utf-8")\n',
+        textwrap.dedent(
+            f"""\
+            import json, pathlib, sys
+
+            log = pathlib.Path({str(logPath)!r})
+            with log.open("a", encoding="utf-8") as fh:
+                fh.write(json.dumps({{"tool": "build", "args": sys.argv[1:]}}) + "\\n")
+            ver = pathlib.Path("semver.txt").read_text(encoding="utf-8").strip()
+            dist = pathlib.Path("dist")
+            dist.mkdir(exist_ok=True)
+            (dist / f"demo-{{ver}}.tar.gz").write_text("sdist", encoding="utf-8")
+            (dist / f"demo-{{ver}}-py3-none-any.whl").write_text("wheel", encoding="utf-8")
+            """,
+        ),
         encoding="utf-8",
     )
 
     fakeTwine = tmpPath / "fake_twine.py"
     fakeTwine.write_text(
-        "import json, os, pathlib, sys\n"
-        + f"log = pathlib.Path({str(logPath)!r})\n"
-        + 'with log.open("a", encoding="utf-8") as fh:\n'
-        + '    fh.write(json.dumps({"tool": "twine", "args": sys.argv[1:], '
-        + '"user": os.environ.get("TWINE_USERNAME"), "auth": os.environ.get("TWINE_PASSWORD")}) + "\\n")\n'
-        + f'if {failUpload!r} and sys.argv[1:2] == ["upload"]:\n'
-        + "    sys.exit(2)\n"
-        + f"failSuffix = {failUploadSuffix!r}\n"
-        + 'if failSuffix is not None and sys.argv[1:2] == ["upload"] '
-        + "and any(arg.endswith(failSuffix) for arg in sys.argv[2:]):\n"
-        + "    sys.exit(3)\n",
+        textwrap.dedent(
+            f"""\
+            import json, os, pathlib, sys
+
+            log = pathlib.Path({str(logPath)!r})
+            with log.open("a", encoding="utf-8") as fh:
+                entry = {{
+                    "tool": "twine",
+                    "args": sys.argv[1:],
+                    "user": os.environ.get("TWINE_USERNAME"),
+                    "auth": os.environ.get("TWINE_PASSWORD"),
+                }}
+                fh.write(json.dumps(entry) + "\\n")
+            if {failUpload!r} and sys.argv[1:2] == ["upload"]:
+                sys.exit(2)
+            failSuffix = {failUploadSuffix!r}
+            if failSuffix is not None and sys.argv[1:2] == ["upload"] and any(
+                arg.endswith(failSuffix) for arg in sys.argv[2:]
+            ):
+                sys.exit(3)
+            """,
+        ),
         encoding="utf-8",
     )
 
     fakeCheckManifest = tmpPath / "fake_check_manifest.py"
     fakeCheckManifest.write_text(
-        "import json, pathlib, sys\n"
-        + f"log = pathlib.Path({str(logPath)!r})\n"
-        + 'with log.open("a", encoding="utf-8") as fh:\n'
-        + '    fh.write(json.dumps({"tool": "check_manifest", "args": sys.argv[1:]}) + "\\n")\n',
+        textwrap.dedent(
+            f"""\
+            import json, pathlib, sys
+
+            log = pathlib.Path({str(logPath)!r})
+            with log.open("a", encoding="utf-8") as fh:
+                fh.write(json.dumps({{"tool": "check_manifest", "args": sys.argv[1:]}}) + "\\n")
+            """,
+        ),
         encoding="utf-8",
     )
 
@@ -143,6 +176,8 @@ def _installFakeTooling(
     }
 
     def _fakeFindTool(moduleName: str, _executableName: str) -> list[str] | None:
+        if moduleName in missingTools:
+            return None
         return toolMap.get(moduleName)
 
     monkeypatch.setattr(releaseMod, "findToolCommand", _fakeFindTool)
@@ -244,7 +279,7 @@ def test_resolve_secrets_path(tmp_path: Path) -> None:
 
 
 def test_in_project_root_checks_git_and_name(tmp_path: Path) -> None:
-    """Verify git top-level and optional project-name matching."""
+    """Verify git top-level and strict remote repository-name matching."""
     repo, _ = _createSampleRepo(tmp_path, name="demo", withRemote=False)
     assert inProjectRoot(repo, "demo") is True
     assert inProjectRoot(repo, "other") is False
@@ -253,6 +288,29 @@ def test_in_project_root_checks_git_and_name(tmp_path: Path) -> None:
     sub = repo / "sub"
     sub.mkdir()
     assert inProjectRoot(sub, "demo") is False
+
+    # Remotes must match the repository name segment (without .git), not owner/host/substring.
+    _git(repo, "remote", "add", "origin", "https://github.com/demo/other.git")
+    assert inProjectRoot(repo, "demo") is False
+    assert inProjectRoot(repo, "other") is True
+
+    _git(repo, "remote", "set-url", "origin", "https://demo.example.com/")
+    assert inProjectRoot(repo, "demo") is False
+
+    _git(repo, "remote", "set-url", "origin", "https://github.com/owner/demo-origin.git")
+    assert inProjectRoot(repo, "demo") is False
+
+    for matchingUrl in (
+        "https://github.com/owner/demo.git",
+        "https://github.com/owner/demo/",
+        "git@github.com:owner/demo.git",
+        "git@github.com:demo.git",
+        "ssh://git@github.com:22/owner/demo.git",
+        "/srv/repos/demo/.git",
+    ):
+        _git(repo, "remote", "set-url", "origin", matchingUrl)
+        assert inProjectRoot(repo, "demo") is True, matchingUrl
+        assert inProjectRoot(repo, "owner") is False, matchingUrl
 
 
 def test_dry_run_builds_validates_and_rolls_back(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -289,7 +347,9 @@ def test_dry_run_builds_validates_and_rolls_back(tmp_path: Path, monkeypatch: py
 
     calls = _readToolLog(logPath)
     assert [call["tool"] for call in calls] == ["build", "twine"]
-    assert calls[1]["args"][0] == "check"  # type: ignore[index]
+    checkArgs = calls[1]["args"]
+    assert isinstance(checkArgs, list)
+    assert checkArgs[0] == "check"
 
 
 def test_full_release_commits_tags_pushes_and_writes_generated_files(
@@ -726,12 +786,7 @@ def test_resume_after_git_push_failure(
     assert loadPendingRelease(repo) is not None
 
     # Attach remote and finish via CLI `tablish resume`
-    remoteRepo = tmp_path / "pushfail-origin.git"
-    subprocess.run(["git", "init", "--bare", str(remoteRepo)], check=True, capture_output=True)
-    _git(repo, "remote", "add", "origin", str(remoteRepo))
-    branch = _git(repo, "branch", "--show-current")
-    _git(repo, "config", f"branch.{branch}.remote", "origin")
-    _git(repo, "config", f"branch.{branch}.merge", f"refs/heads/{branch}")
+    _attachBareOrigin(tmp_path, repo, "pushfail")
 
     callsBeforeResume = len(_readToolLog(logPath))
     assert main(["resume", "-C", str(repo)]) == 0
@@ -791,12 +846,7 @@ def test_resume_after_git_commit_failure_and_multi_step_retry(
     _git(repo, "tag", "-d", "v1.3.0")
 
     # Attach remote and finish; resume recreates v1.3.0 on HEAD and pushes
-    remoteRepo = tmp_path / "hookdemo-origin.git"
-    subprocess.run(["git", "init", "--bare", str(remoteRepo)], check=True, capture_output=True)
-    _git(repo, "remote", "add", "origin", str(remoteRepo))
-    branch = _git(repo, "branch", "--show-current")
-    _git(repo, "config", f"branch.{branch}.remote", "origin")
-    _git(repo, "config", f"branch.{branch}.merge", f"refs/heads/{branch}")
+    _attachBareOrigin(tmp_path, repo, "hookdemo")
 
     callsBeforeResume = len(_readToolLog(logPath))
     result = resumeRelease(ReleaseOptions(resume=True), projectRoot=repo)
@@ -1024,3 +1074,80 @@ def test_standalone_tablish_kdl_without_pyproject(
     result = createRelease(ReleaseOptions(bump="feature", dryRun=True), projectRoot=repo)
     assert result.newVersion == "1.3.0"
     assert result.dryRun is True
+
+
+def test_load_pending_release_validation_errors(tmp_path: Path) -> None:
+    """Reject malformed pending-release state files with specific field diagnostics."""
+    repo, _ = _createSampleRepo(tmp_path, name="badpending", withRemote=False)
+    pendingPath = repo / ".git" / PENDING_RELEASE_FILENAME
+
+    validPayload: dict[str, object] = {
+        "stage": "git",
+        "previousVersion": "1.2.3",
+        "newVersion": "1.2.4",
+        "targetRepo": "pypi.org",
+        "repositoryUrl": None,
+        "commitFiles": ["semver.txt"],
+        "commitMessage": "Bump semver to 1.2.4",
+        "tagName": "v1.2.4",
+        "tagMessage": "Release 1.2.4",
+        "uploadedFiles": ["dist/demo-1.2.4.tar.gz"],
+        "remainingFiles": [],
+    }
+
+    pendingPath.write_text("{not json", encoding="utf-8")
+    with pytest.raises(ReleaseError, match="Invalid pending release state"):
+        loadPendingRelease(repo)
+
+    pendingPath.write_text("[]", encoding="utf-8")
+    with pytest.raises(ReleaseError, match="expected a JSON object"):
+        loadPendingRelease(repo)
+
+    cases: list[tuple[dict[str, object], str]] = [
+        ({**validPayload, "stage": "bogus"}, "'stage'"),
+        ({**validPayload, "newVersion": "   "}, "'newVersion'"),
+        ({**validPayload, "commitFiles": []}, "'commitFiles'"),
+        ({**validPayload, "tagName": "v1.2.4", "tagMessage": None}, "'tagMessage'"),
+        ({**validPayload, "stage": "upload", "remainingFiles": []}, "'remainingFiles'"),
+    ]
+    for badPayload, expectedMatch in cases:
+        pendingPath.write_text(json.dumps(badPayload), encoding="utf-8")
+        with pytest.raises(ReleaseError, match=expectedMatch):
+            loadPendingRelease(repo)
+
+
+def test_check_manifest_only_required_when_lint_skipped_or_disabled(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Require check-manifest tool only when lint is skipped or disabled and check-manifest is enabled."""
+    repo, _ = _createSampleRepo(tmp_path, name="nomanifest")
+    _installFakeTooling(monkeypatch, tmp_path, missingTools=("check_manifest",))
+    monkeypatch.delenv("TWINE_PASSWORD", raising=False)
+
+    # Lint is enabled and not skipped -> check-manifest is not required for release or info.
+    result = createRelease(ReleaseOptions(bump="bugfix", dryRun=True), projectRoot=repo)
+    assert result.dryRun is True
+    infoWithLint = {
+        item.key: item for item in collectReleaseMetadata(ReleaseOptions(info=True), projectRoot=repo).items
+    }
+    assert infoWithLint["tools"].status == "ok"
+    assert "check-manifest" not in infoWithLint["tools"].value
+
+    # Passing --skip-lint requires check-manifest.
+    with pytest.raises(ReleaseError, match="check-manifest"):
+        createRelease(ReleaseOptions(bump="bugfix", dryRun=True, skipLint=True), projectRoot=repo)
+    infoSkipped = {
+        item.key: item
+        for item in collectReleaseMetadata(ReleaseOptions(info=True, skipLint=True), projectRoot=repo).items
+    }
+    assert infoSkipped["tools"].status == "error"
+    assert "check-manifest: MISSING" in infoSkipped["tools"].value
+
+    # Disabling lint-command in config also requires check-manifest unless check-manifest = false.
+    (repo / "pyproject.toml").write_text(
+        '[project]\nname = "nomanifest"\n\n[tool.tablish]\nlint-command = false\n',
+        encoding="utf-8",
+    )
+    with pytest.raises(ReleaseError, match="check-manifest"):
+        createRelease(ReleaseOptions(bump="bugfix", dryRun=True), projectRoot=repo)
