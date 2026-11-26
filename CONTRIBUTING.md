@@ -16,7 +16,7 @@ Python Version & Dependencies
 -----------------------------
 
 * Target **Python 3.12+** (use modern features such as `from __future__ import annotations`, PEP 695 `type` aliases, `@dataclass(slots=True)`, and `collections.abc`).
-* Keep runtime dependencies focused on release tooling (`build`, `check-manifest`, `twine`) plus the Python standard library.
+* Keep runtime dependencies focused on release tooling (`build`, `check-manifest`, `twine`) and config parsing (`kdl-py`) plus the Python standard library.
 * Development has several dependencies, tracked in `requirements-dev.txt`, needed for linting and testing. These can be installed with `pip install -r requirements-dev.txt`, ideally in a virtual environment (such as with `pyenv` or `uv`).
 
 Naming

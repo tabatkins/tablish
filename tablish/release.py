@@ -16,6 +16,7 @@ from . import t
 from .config import (
     DEFAULT_PYPI_SECRET_KEY,
     DEFAULT_TEST_PYPI_SECRET_KEY,
+    TABLISH_KDL_FILENAME,
     GeneratedFileConfig,
     ReleaseError,
     TablishConfig,
@@ -1267,7 +1268,7 @@ def collectReleaseMetadata(
             key=key,
             value=value,
             source=resolvedConfig.sourceOf(key),
-            sourceDetail=resolvedConfig.inferredOrigin(key),
+            sourceDetail=resolvedConfig.explicitOrigin(key) or resolvedConfig.inferredOrigin(key),
             status=status,
             details=details,
         )
@@ -1280,12 +1281,26 @@ def collectReleaseMetadata(
     else:
         items.append(MetadataItem("Project", "project-root", str(root), "default", "cwd"))
 
+    if not resolvedConfig.hasPyproject:
+        pyprojectDisplay = "not found"
+    elif resolvedConfig.hasTablishTable:
+        pyprojectDisplay = "[tool.tablish] present"
+    else:
+        pyprojectDisplay = "no [tool.tablish] table"
     items.append(
         MetadataItem(
             "Project",
             "pyproject.toml",
-            "[tool.tablish] present" if resolvedConfig.hasTablishTable else "no [tool.tablish] table",
+            pyprojectDisplay,
             "explicit" if resolvedConfig.hasTablishTable else "default",
+        ),
+    )
+    items.append(
+        MetadataItem(
+            "Project",
+            TABLISH_KDL_FILENAME,
+            "present" if resolvedConfig.hasTablishKdl else "not found",
+            "explicit" if resolvedConfig.hasTablishKdl else "default",
         ),
     )
 
@@ -1368,7 +1383,15 @@ def collectReleaseMetadata(
     if opts.test:
         items.append(MetadataItem("PyPI & Credentials", "target-repo", "test.pypi.org", "cli", "--test"))
     elif resolvedConfig.pypiUrl is not None:
-        items.append(MetadataItem("PyPI & Credentials", "target-repo", resolvedConfig.pypiUrl, "explicit"))
+        items.append(
+            MetadataItem(
+                "PyPI & Credentials",
+                "target-repo",
+                resolvedConfig.pypiUrl,
+                "explicit",
+                resolvedConfig.explicitOrigin("pypi-url"),
+            ),
+        )
     else:
         items.append(MetadataItem("PyPI & Credentials", "target-repo", "pypi.org", "default"))
 

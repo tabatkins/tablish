@@ -16,6 +16,7 @@ authors = [
 dependencies = [
     "build",
     "check-manifest",
+    "kdl-py",
     "twine",
 ]
 classifiers = [

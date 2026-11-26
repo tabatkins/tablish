@@ -1,6 +1,6 @@
 # tablish
 
-A typed Python 3.12+ CLI tool for releasing Python packages to PyPI, configured via `[tool.tablish]` in `pyproject.toml`.
+A typed Python 3.12+ CLI tool for releasing Python packages to PyPI, configured via `tablish.kdl` and/or `[tool.tablish]` in `pyproject.toml`.
 
 ## What it does
 
@@ -44,7 +44,7 @@ tablish resume                  # finish remaining upload and/or git steps after
 
 ### `tablish info`
 
-Prints the resolved metadata and preflight status that `tablish` would use to publish—including project paths, current version, target repository, credential and gitignore status (without printing any token), lint/build settings, required tools, and git release settings. Each entry shows whether it was set explicitly in `[tool.tablish]`, inferred from `pyproject.toml`, defaulted, or overridden by CLI flags (such as `--test`, `--skip-lint`, `--no-tag`, `--verbose-pypi`, or `-C`), using terminal color when supported.
+Prints the resolved metadata and preflight status that `tablish` would use to publish—including project paths, current version, target repository, credential and gitignore status (without printing any token), lint/build settings, required tools, and git release settings. Each entry shows whether it was set explicitly in `tablish.kdl` or `[tool.tablish]` in `pyproject.toml`, inferred from `pyproject.toml`, defaulted, or overridden by CLI flags (such as `--test`, `--skip-lint`, `--no-tag`, `--verbose-pypi`, or `-C`), using terminal color when supported.
 
 ### `tablish resume`
 
@@ -63,7 +63,11 @@ By default, `tablish` reads a JSON file at `secrets.json` (gitignored!) in your 
 
 If the secrets file is inside the repository (including the default `secrets.json`), `tablish` verifies that it is untracked and gitignored and refuses to run if it is not. If the secrets file is absent, `tablish` falls back to the `TWINE_PASSWORD` environment variable (and `TWINE_USERNAME`, defaulting to `__token__`). You can also point `secrets-file` to a shared path outside the repository such as `~/.config/tablish/secrets.json`.
 
-## Configuration (`pyproject.toml`)
+## Configuration (`pyproject.toml` and `tablish.kdl`)
+
+`tablish` can be configured via `[tool.tablish]` in `pyproject.toml`, via a `tablish.kdl` file at the project root, or both. When `tablish.kdl` is present alongside `pyproject.toml`, any keys defined in `tablish.kdl` override the corresponding values from `pyproject.toml` (while unset keys still fall back to `[tool.tablish]`, inferred `pyproject.toml` metadata, and defaults). A standalone `tablish.kdl` without `pyproject.toml` is also supported.
+
+### `pyproject.toml`
 
 All keys under `[tool.tablish]` are optional; sensible defaults are inferred from `pyproject.toml`.
 
@@ -86,9 +90,31 @@ tag-message = "Release {version}"
 commit-message = "Bump semver to {version}"
 ```
 
+### `tablish.kdl`
+
+Top-level nodes in `tablish.kdl` use the same key names as `[tool.tablish]`:
+
+```kdl
+project-name "myproject"            // set "" or null to disable remote/dir match
+semver-file "semver.txt"
+secrets-file "secrets.json"
+pypi-secret-key "pypi.org release key"
+test-pypi-secret-key "test.pypi.org release key"
+pypi-url null                       // optional custom repository URL (or "" / null for default PyPI)
+test-pypi-url "https://test.pypi.org/legacy/"
+build-dirs "build" "dist"           // positional args, child `- "dir"` nodes, or empty for []
+lint-command "sh" "lint"            // argv args, single shell string, or false / null to disable
+check-manifest true
+check-manifest-args "--no-build-isolation"
+tag true
+tag-format "v{version}"
+tag-message "Release {version}"
+commit-message "Bump semver to {version}"
+```
+
 ### Extra generated files
 
-Projects that also maintain generated version/build info files can declare `[[tool.tablish.generated-files]]` entries. Each entry takes a relative `path` and either a `command` (whose stripped stdout is written to `path`) or a `template` string (with `{version}` replaced):
+Projects that also maintain generated version/build info files can declare `[[tool.tablish.generated-files]]` entries in `pyproject.toml` (or `generated-file` / `generated-files` nodes in `tablish.kdl`). Each entry takes a relative `path` and either a `command` (whose stripped stdout is written to `path`) or a `template` string (with `{version}` replaced):
 
 ```toml
 [[tool.tablish.generated-files]]
@@ -98,6 +124,23 @@ command = ["git", "log", "-1", "--format=mypkg version %h, updated %cd"]
 [[tool.tablish.generated-files]]
 path = "mypkg/_version.py"
 template = '__version__ = "{version}"\n'
+```
+
+In `tablish.kdl`, generated files can be written as repeated top-level `generated-file` nodes and/or inside a `generated-files { ... }` block (using `file`, `generated-file`, `-`, or the path itself as the child node name):
+
+```kdl
+generated-file "mypkg/version-info.txt" {
+    command "git" "log" "-1" "--format=mypkg version %h, updated %cd"
+}
+generated-file "mypkg/_version.py" template="__version__ = \"{version}\"\n"
+
+// Or grouped in a block (use an empty `generated-files {}` to clear entries from pyproject.toml):
+generated-files {
+    file "mypkg/version-info.txt" {
+        command "git" "log" "-1" "--format=mypkg version %h, updated %cd"
+    }
+    "mypkg/_version.py" template="__version__ = \"{version}\"\n"
+}
 ```
 
 Generated files are written alongside `semver-file` before building, staged and committed on real releases, and automatically rolled back (or deleted if newly created) on `--dry-run`, `--test`, or errors.

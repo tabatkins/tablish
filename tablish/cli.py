@@ -77,7 +77,8 @@ def _paint(text: str, code: str, *, useColor: bool) -> str:
 def _formatBadge(item: MetadataItem) -> tuple[str, str]:
     """Return (plainBadgeText, ansiColorCode) for a metadata item's provenance or status."""
     if item.source == "explicit":
-        return ("[explicit]", _ANSI_GREEN_BOLD)
+        label = f"[explicit: {item.sourceDetail}]" if item.sourceDetail else "[explicit]"
+        return (label, _ANSI_GREEN_BOLD)
     if item.source == "cli":
         label = f"[cli: {item.sourceDetail}]" if item.sourceDetail else "[cli]"
         return (label, _ANSI_MAGENTA_BOLD)
@@ -158,7 +159,7 @@ def _buildArgParser() -> argparse.ArgumentParser:
     """Create the CLI argument parser for tablish."""
     parser = argparse.ArgumentParser(
         prog="tablish",
-        description="Release a Python project to PyPI using [tool.tablish] in pyproject.toml.",
+        description="Release a Python project to PyPI using tablish.kdl and/or [tool.tablish] in pyproject.toml.",
     )
     parser.add_argument(
         "target",

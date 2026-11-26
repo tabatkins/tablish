@@ -944,3 +944,83 @@ def test_version_write_rollback_and_post_upload_cleanup_failure_resumes(
     assert not (repo / "dist").exists()
     assert loadPendingRelease(repo) is None
     assert "refs/tags/v1.2.4" in _git(repo, "ls-remote", "origin")
+
+
+def test_tablish_kdl_overrides_pyproject_in_info_and_release(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Verify tablish.kdl overrides pyproject.toml in both `tablish info` and full releases."""
+    pyproject = (
+        '[project]\nname = "kdldemo"\n\n'
+        + "[tool.setuptools.dynamic]\n"
+        + 'version = {file = "semver.txt"}\n\n'
+        + "[tool.tablish]\n"
+        + 'commit-message = "From TOML {version}"\n'
+        + 'tag-message = "TOML tag {version}"\n'
+    )
+    repo, _ = _createSampleRepo(tmp_path, name="kdldemo", pyprojectBody=pyproject)
+    (repo / "tablish.kdl").write_text(
+        'commit-message "From KDL {version}"\n'
+        + 'tag-format "kdl-{version}"\n'
+        + "generated-files {\n"
+        + '    "generated/version.py" template=r#"__version__ = "{version}""#\n'
+        + "}\n",
+        encoding="utf-8",
+    )
+    _git(repo, "add", "tablish.kdl")
+    _git(repo, "commit", "-m", "Add tablish.kdl")
+    (repo / "secrets.json").write_text(json.dumps({"pypi.org release key": "pypi-live"}), encoding="utf-8")
+    _installFakeTooling(monkeypatch, tmp_path)
+
+    metadata = collectReleaseMetadata(ReleaseOptions(info=True), projectRoot=repo)
+    byKey = {item.key: item for item in metadata.items}
+    assert byKey["pyproject.toml"].value == "[tool.tablish] present"
+    assert byKey["tablish.kdl"].value == "present"
+    assert byKey["tablish.kdl"].source == "explicit"
+    assert byKey["commit-message"].value == "From KDL {version}"
+    assert byKey["commit-message"].source == "explicit"
+    assert byKey["commit-message"].sourceDetail == "tablish.kdl"
+    assert byKey["tag-message"].value == "TOML tag {version}"
+    assert byKey["tag-message"].source == "explicit"
+    assert byKey["tag-message"].sourceDetail == "pyproject.toml"
+    assert byKey["project-name"].source == "inferred"
+    assert byKey["semver-file"].source == "inferred"
+
+    plainText = formatReleaseMetadata(metadata, useColor=False)
+    assert "[explicit: tablish.kdl]" in plainText
+    assert "[explicit: pyproject.toml]" in plainText
+
+    result = createRelease(ReleaseOptions(bump="bugfix"), projectRoot=repo)
+    assert result.newVersion == "1.2.4"
+    assert result.tagName == "kdl-1.2.4"
+    assert _git(repo, "log", "-1", "--format=%s") == "From KDL 1.2.4"
+    assert _git(repo, "tag", "-l") == "kdl-1.2.4"
+    assert (repo / "generated" / "version.py").read_text(encoding="utf-8") == '__version__ = "1.2.4"'
+
+
+def test_standalone_tablish_kdl_without_pyproject(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Allow projects configured purely with tablish.kdl (no pyproject.toml) to inspect and dry-run."""
+    repo, _ = _createSampleRepo(tmp_path, name="kdlonly", withRemote=False)
+    (repo / "pyproject.toml").unlink()
+    (repo / "tablish.kdl").write_text('project-name "kdlonly"\nlint-command false\n', encoding="utf-8")
+    _git(repo, "add", "-A")
+    _git(repo, "commit", "-m", "Switch to standalone tablish.kdl")
+    _installFakeTooling(monkeypatch, tmp_path)
+    monkeypatch.delenv("TWINE_PASSWORD", raising=False)
+
+    metadata = collectReleaseMetadata(ReleaseOptions(info=True), projectRoot=repo)
+    byKey = {item.key: item for item in metadata.items}
+    assert byKey["pyproject.toml"].value == "not found"
+    assert byKey["pyproject.toml"].source == "default"
+    assert byKey["tablish.kdl"].value == "present"
+    assert byKey["tablish.kdl"].source == "explicit"
+    assert byKey["project-name"].value == "kdlonly"
+    assert byKey["project-name"].sourceDetail == "tablish.kdl"
+
+    result = createRelease(ReleaseOptions(bump="feature", dryRun=True), projectRoot=repo)
+    assert result.newVersion == "1.3.0"
+    assert result.dryRun is True
